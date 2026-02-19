@@ -1409,6 +1409,15 @@ async def auth(ctx: Context, mint: bool, force: bool, password: bool):
         print(f"Minted {auth_wallet.unit.str(sum_proofs(new_proofs))} auth tokens.")
 
 
+@cli.command("walletd", help="Run wallet daemon (FastAPI) over Unix domain socket.")
+@click.option("--uds", default="/run/cashu/walletd.sock", show_default=True)
+@click.option("--log-level", default="info", show_default=True)
+def walletd(uds: str, log_level: str):
+    import uvicorn
+    from ...wallet.walletd import app
+    uvicorn.run(app, uds=uds, log_level=log_level)
+
+
 @cli.group(cls=NaturalOrderGroup)
 def lnurl():
     """LNURL commands."""
