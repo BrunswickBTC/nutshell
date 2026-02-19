@@ -20,14 +20,14 @@ UMask=0007
 # Run from the nutshell service home + repo directory
 WorkingDirectory=/var/lib/nutshell/nutshell
 
-# If poetry is installed via pyenv for the nutshell user, use a login shell so PATH contains pyenv shims.
-# This avoids hardcoding the poetry path.
-ExecStartPre=/bin/bash -lc 'rm -f /run/cashu/walletd.sock; install -d -m 0750 -o cashu -g lnbits /run/cashu'
-#ExecStart=/bin/bash -lc 'poetry run cashu walletd --uds /run/cashu/walletd.sock'
-ExecStart=/bin/bash -lc 'poetry run cashu walletd'
+# Do NOT depend on .profile/.bashrc. Systemd does not run interactive shell init.
+Environment=HOME=/var/lib/nutshell
+Environment=PYENV_ROOT=/var/lib/nutshell/.pyenv
+Environment=PATH=/var/lib/nutshell/.pyenv/shims:/var/lib/nutshell/.pyenv/bin:/var/lib/nutshell/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Enforce ownership/mode after start (you asked explicitly)
-ExecStartPost=/bin/bash -lc 'chown nutshell:cashu /run/cashu/walletd && chmod 0660 /run/cashu/walletd'
+# If you use pyenv-virtualenv, it is typically not required just to run poetry,
+# as long as shims are on PATH.
+ExecStart=/bin/bash -c '/var/lib/nutshell/.local/bin/poetry run cashu walletd --uds /run/cashu/walletd.sock'
 
 Restart=always
 RestartSec=2
