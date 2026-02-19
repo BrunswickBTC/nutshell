@@ -241,7 +241,18 @@ class LedgerAPI(SupportsAuth):
 
         keys_dict: dict = resp.json()
         assert len(keys_dict), Exception("did not receive any keys")
-        keys = KeysResponse.model_validate(keys_dict)
+        #keys = KeysResponse.model_validate(keys_dict)
+        from pydantic import ValidationError
+
+        try:
+            keys = KeysResponse.model_validate(keys_dict)
+        except ValidationError:
+            # Some mints omit "active" on /v1/keys; interpret as active.
+            for ks in keys_dict.get("keysets", []):
+                if isinstance(ks, dict):
+                    ks.setdefault("active", True)
+            keys = KeysResponse.model_validate(keys_dict)
+        
         keysets_str = " ".join([f"{k.id} ({k.unit})" for k in keys.keysets])
         logger.debug(f"Received {len(keys.keysets)} keysets from mint: {keysets_str}.")
         ret = [
@@ -280,7 +291,19 @@ class LedgerAPI(SupportsAuth):
 
         keys_dict = resp.json()
         assert len(keys_dict), Exception("did not receive any keys")
-        keys = KeysResponse.model_validate(keys_dict)
+        #keys = KeysResponse.model_validate(keys_dict)
+        from pydantic import ValidationError
+
+        try:
+            keys = KeysResponse.model_validate(keys_dict)
+        except ValidationError:
+            # Some mints omit "active" on /v1/keys; interpret as active.
+            for ks in keys_dict.get("keysets", []):
+                if isinstance(ks, dict):
+                    ks.setdefault("active", True)
+            keys = KeysResponse.model_validate(keys_dict)
+
+
         this_keyset = keys.keysets[0]
         keyset_keys = {
             int(amt): PublicKey(bytes.fromhex(val))

@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from .wallet import Wallet
 from ..core.base import Unit
+from ..core.settings import settings
 
 app = FastAPI(title="nutshell-walletd", version="0.1")
 
@@ -66,34 +67,41 @@ class MeltExecuteResp(BaseModel):
 # --------- wallet construction helpers ---------
 
 def _db_path() -> str:
-    p = os.environ.get("CASHU_WALLET_DB")
-    if not p:
-        raise RuntimeError("CASHU_WALLET_DB env var not set")
-    return p
+    # Match CLI: ~/.cashu/<walletname>
+    return os.path.join(settings.cashu_dir, settings.wallet_name)
 
 def _default_mint() -> str:
-    u = os.environ.get("CASHU_DEFAULT_MINT_URL")
-    if not u:
-        raise RuntimeError("CASHU_DEFAULT_MINT_URL env var not set")
-    return u
+    # Match CLI default host
+    return settings.mint_url
 
 async def _wallet_for(mint_url: str, unit: Unit) -> Wallet:
-    # Uses the same pattern as the CLI helpers: Wallet.with_db(...) with a shared db path. :contentReference[oaicite:5]{index=5}
-    return await Wallet.with_db(
+    # Match CLI init: run migrations first, then load wallet normally. :contentReference[oaicite:2]{index=2}
+    db_path = _db_path()
+    wallet_name = settings.wallet_name
+    await Wallet.with_db(
         url=mint_url,
-        db=_db_path(),
-        name="walletd",
+        db=db_path,
+        name=wallet_name,
+        unit=unit.name,
+        skip_db_read=True,
+    )
+    w = await Wallet.with_db(
+        url=mint_url,
+        db=db_path,
+        name=wallet_name,
         unit=unit.name,
         skip_db_read=False,
         load_all_keysets=True,
     )
-
+    if not w.mint_info:
+        await w.load_mint()
+    return w
 
 # --------- endpoints ---------
 
 @app.get("/v1/balance", response_model=BalanceResp)
-async def balance(unit: str = "sat"):
-    u = Unit[unit]
+async def balance(unit: Optional[str] = None):
+    u = Unit[unit or settings.wallet_unit]
     w = await _wallet_for(_default_mint(), u)
     await w.load_proofs(reload=True, all_keysets=True)
     per_mint = await w.balance_per_minturl(unit=u)  # dict keyed by minturl :contentReference[oaicite:6]{index=6}
