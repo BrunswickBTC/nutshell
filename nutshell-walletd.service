@@ -1,0 +1,41 @@
+[Unit]
+Description=Nutshell Cashu walletd (UDS)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+
+# Run as the separate nutshell user, with the cashu group for socket ACLs
+User=nutshell
+Group=cashu
+
+# Ensure /run/cashu exists with the required ownership + mode
+RuntimeDirectory=cashu
+RuntimeDirectoryMode=0750
+
+# Ensure the socket ends up 0660 (uvicorn uses process umask when creating it)
+UMask=0007
+
+# Run from the nutshell service home + repo directory
+WorkingDirectory=/var/lib/nutshell/nutshell
+
+# If poetry is installed via pyenv for the nutshell user, use a login shell so PATH contains pyenv shims.
+# This avoids hardcoding the poetry path.
+ExecStartPre=/bin/bash -lc 'rm -f /run/cashu/walletd.sock; install -d -m 0750 -o cashu -g lnbits /run/cashu'
+#ExecStart=/bin/bash -lc 'poetry run cashu walletd --uds /run/cashu/walletd.sock'
+ExecStart=/bin/bash -lc 'poetry run cashu walletd'
+
+# Enforce ownership/mode after start (you asked explicitly)
+ExecStartPost=/bin/bash -lc 'chown nutshell:cashu /run/cashu/walletd && chmod 0660 /run/cashu/walletd'
+
+Restart=always
+RestartSec=2
+
+# Optional: tighten systemd sandboxing a bit without breaking file/socket access
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
