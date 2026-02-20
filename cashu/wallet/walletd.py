@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
@@ -144,6 +145,39 @@ async def _refresh_mint_state(w):
             except TypeError:
                 await fn()
 
+# walletd_claims: quote claimed locally (proofs minted + stored)
+CLAIMS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS walletd_claims (
+  mint_url TEXT NOT NULL,
+  unit     TEXT NOT NULL,
+  quote    TEXT NOT NULL,
+  claimed_time INTEGER NOT NULL,
+  PRIMARY KEY (mint_url, unit, quote)
+);
+"""
+
+async def _ensure_claims_table(db):
+    # best-effort idempotent
+    try:
+        await db.execute(CLAIMS_TABLE_SQL)
+    except Exception:
+        pass
+
+async def _mark_claimed(db, mint_url: str, unit: str, quote: str, ts: int):
+    await _ensure_claims_table(db)
+    await db.execute(
+        "INSERT OR REPLACE INTO walletd_claims (mint_url, unit, quote, claimed_time) VALUES (?, ?, ?, ?)",
+        (mint_url, unit, quote, ts),
+    )
+
+async def _is_claimed(db, mint_url: str, unit: str, quote: str) -> bool:
+    await _ensure_claims_table(db)
+    row = await db.fetchone(
+        "SELECT 1 FROM walletd_claims WHERE mint_url = ? AND unit = ? AND quote = ? LIMIT 1",
+        (mint_url, unit, quote),
+    )
+    return bool(row)
+
 # --------- endpoints ---------
 
 @app.get("/v1/balance", response_model=BalanceResp)
@@ -196,6 +230,9 @@ async def mint_execute(req: MintExecuteReq):
         )
 
     await w.mint(q.amount, quote_id=q.quote)
+
+    await _mark_claimed(w.db, mint_url, req.unit, req.quote, int(time.time()))
+
     return MintExecuteResp(
         mint_url=mint_url,
         quote=req.quote,
@@ -215,6 +252,21 @@ async def mint_status(req: MintStatusReq):
     # if q has a state field, prefer it:
     if getattr(q, "state", None):
         status = str(q.state)
+
+    mint_paid = (q.state == "paid")
+
+    claimed = await is_mint_claimed(w.db, mint_url, req.quote)
+
+    if claimed:
+        status = "paid"
+        paid = True
+    elif mint_paid:
+        status = "claimable"
+        paid = False
+    else:
+        status = "pending"
+        paid = False
+
     return MintStatusResp(paid=bool(q.paid), status=status, failed=status in {"failed","expired","canceled"})
 
 @app.post("/v1/melt/quote", response_model=MeltQuoteResp)
