@@ -455,6 +455,22 @@ async def get_bolt11_melt_quotes(
     return [MeltQuote.from_row(r) for r in rows]  # type: ignore
 
 
+async def get_bolt11_melt_quote_row(db, quote: str) -> Optional[Dict[str, Any]]:
+    # works with the DB wrapper used in nutshell (db.fetch_one pattern)
+    row = await db.fetch_one(
+        """
+        SELECT quote, amount, state, fee_paid, payment_preimage
+        FROM bolt11_melt_quotes
+        WHERE quote = :quote
+        """,
+        {"quote": quote},
+    )
+    if not row:
+        return None
+    # row may be Mapping-like depending on your DB layer
+    return dict(row)
+
+
 async def update_bolt11_melt_quote(
     db: Database,
     quote: str,

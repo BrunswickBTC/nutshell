@@ -243,6 +243,7 @@ class PostMeltQuoteResponse(BaseModel):
         str
     ]  # output payment request (optional for BACKWARDS COMPAT mint response < 0.17.0)
     fee_reserve: int  # input fee reserve
+    fee_paid: Optional[int] = None  # fee actually paid (sat)
     paid: Optional[bool] = (
         None  # whether the request has been paid # DEPRECATED as per NUT PR #136
     )

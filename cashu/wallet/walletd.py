@@ -10,6 +10,8 @@ from .wallet import Wallet
 from ..core.base import Unit
 from ..core.settings import settings
 
+from .crud import get_bolt11_melt_quote_row
+
 app = FastAPI(title="nutshell-walletd", version="0.1")
 
 
@@ -129,6 +131,19 @@ async def _wallet_for(mint_url: str, unit: Unit) -> Wallet:
         await w.load_mint()
     return w
 
+async def _refresh_mint_state(w):
+    await w.load_mint()
+
+    # try the likely refresh methods across versions
+    for name in ("load_keysets", "load_keys", "load_mint_keys", "load_mint_keysets"):
+        fn = getattr(w, name, None)
+        if fn:
+            try:
+                # some variants accept reload=True
+                await fn(reload=True)
+            except TypeError:
+                await fn()
+
 # --------- endpoints ---------
 
 @app.get("/v1/balance", response_model=BalanceResp)
@@ -165,6 +180,10 @@ async def mint_execute(req: MintExecuteReq):
     u = Unit[req.unit]
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)
+
+    await _refresh_mint_state(w)
+    await w.load_proofs(reload=True)  # fine to keep
+
     await w.load_mint()
 
     q = await w.get_mint_quote(req.quote)
@@ -213,6 +232,7 @@ async def melt_quote(req: MeltQuoteReq):
         unit=u.name,
     )
 
+
 @app.post("/v1/melt/execute", response_model=MeltExecuteResp)
 async def melt_execute(req: MeltExecuteReq):
     u = Unit[req.unit]
@@ -232,17 +252,33 @@ async def melt_execute(req: MeltExecuteReq):
 
     resp = await w.melt(send_proofs, req.invoice, req.fee_reserve, req.quote)
 
-    fee_paid = getattr(resp, "fee_paid", None) or getattr(mq, "fee_paid", None)
-    preimage = getattr(resp, "preimage", None) or getattr(resp, "payment_preimage", None)
+    row = await get_bolt11_melt_quote_row(w.db, req.quote)
+
+    fee_paid_sat = None
+    preimage = resp.payment_preimage
+
+    if row and row.get("fee_paid") is not None:
+        fee_paid_total_sat = int(row["fee_paid"])
+        amount_sat = int(row.get("amount") or amount)
+        fee_paid_sat = max(0, fee_paid_total_sat - amount_sat)
+    
+        # prefer DB preimage if present (should match resp)
+        if row.get("payment_preimage"):
+            preimage = row["payment_preimage"]
+
+    state = (resp.state or "").lower()
+    paid = state == "paid"
+    status = state or ("paid" if paid else "pending")
 
     return MeltExecuteResp(
         mint_url=req.mint_url,
         quote=req.quote,
-        status="paid",
-        paid=True,
+        status=status,
+        paid=paid,
         fee_paid_sat=fee_paid_sat,
         preimage=preimage,
     )
+
 
 @app.post("/v1/melt/status", response_model=MeltStatusResp)
 async def melt_status(req: MeltStatusReq):
@@ -258,19 +294,27 @@ async def melt_status(req: MeltStatusReq):
 
     mq = await get_melt(req.quote)
 
-    paid = bool(getattr(mq, "paid", False))
-    status = "paid" if paid else "pending"
-    if getattr(mq, "state", None):
-        status = str(mq.state)
+    row = await get_bolt11_melt_quote_row(w.db, req.quote)
 
-    fee_paid = getattr(mq, "fee_paid", None)
-    preimage = getattr(mq, "preimage", None) or getattr(mq, "payment_preimage", None)
+    fee_paid_sat = None
+    preimage = mq.payment_preimage
+
+    if row and row.get("fee_paid") is not None:
+        fee_paid_total_sat = int(row["fee_paid"])
+        amount_sat = int(row.get("amount") or getattr(mq, "amount", 0) or 0)
+        fee_paid_sat = max(0, fee_paid_total_sat - amount_sat)
+        if row.get("payment_preimage"):
+            preimage = row["payment_preimage"]
+
+    state = (mq.state or "").lower()
+    paid = state == "paid"
+    status = state or ("paid" if paid else "pending")
 
     return MeltStatusResp(
         paid=paid,
         status=status,
-        failed=status in {"failed","expired","canceled"},
-        fee_paid_sat=int(fee_paid) if fee_paid is not None else None,
-        preimage=str(preimage) if preimage is not None else None,
+        failed=status in {"failed","expired","canceled","unpaid"},
+        fee_paid_sat=fee_paid_sat,
+        preimage=preimage,
     )
 
