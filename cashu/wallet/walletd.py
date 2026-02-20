@@ -16,9 +16,12 @@ app = FastAPI(title="nutshell-walletd", version="0.1")
 # --------- request/response models ---------
 
 class BalanceResp(BaseModel):
+    wallet: str
     unit: str
-    total_available: int
-    per_mint: Dict[str, Dict[str, Any]]  # {"https://mint": {"balance":..., "available":..., "unit":...}}
+    available: int
+    balance: int
+    default_mint: str
+    per_mint: Dict[str, Dict[str, Any]]
 
 class MintQuoteReq(BaseModel):
     amount: int
@@ -37,6 +40,12 @@ class MintExecuteReq(BaseModel):
     quote: str
     unit: str = "sat"
     mint_url: Optional[str] = None
+
+class MintExecuteResp(BaseModel):
+    mint_url: str
+    quote: str
+    status: str  # "pending" | "paid" | "failed"
+    paid: bool
 
 class MeltQuoteReq(BaseModel):
     invoice: str
@@ -60,9 +69,32 @@ class MeltExecuteReq(BaseModel):
 class MeltExecuteResp(BaseModel):
     mint_url: str
     quote: str
+    status: str  # "paid" | "pending" | "failed"
     paid: bool
-    fee_paid: Optional[int] = None
+    fee_paid_sat: Optional[int] = None
+    preimage: Optional[str] = None
 
+class MintStatusReq(BaseModel):
+    quote: str
+    unit: str = "sat"
+    mint_url: Optional[str] = None
+
+class MintStatusResp(BaseModel):
+    paid: bool
+    status: str
+    failed: bool = False
+
+class MeltStatusReq(BaseModel):
+    quote: str
+    unit: str = "sat"
+    mint_url: Optional[str] = None
+
+class MeltStatusResp(BaseModel):
+    paid: bool
+    status: str
+    failed: bool = False
+    fee_paid_sat: Optional[int] = None
+    preimage: Optional[str] = None
 
 # --------- wallet construction helpers ---------
 
@@ -106,7 +138,16 @@ async def balance(unit: Optional[str] = None):
     await w.load_proofs(reload=True, all_keysets=True)
     per_mint = await w.balance_per_minturl(unit=u)  # dict keyed by minturl :contentReference[oaicite:6]{index=6}
     total_avail = sum(int(v["available"]) for v in per_mint.values()) if per_mint else 0
-    return BalanceResp(unit=u.name, total_available=total_avail, per_mint=per_mint)
+
+    default_mint = _default_mint()
+    return BalanceResp(
+        wallet=settings.wallet_name,
+        unit=u.name,
+        available=total_avail,
+        balance=total_avail,
+        default_mint=default_mint,
+        per_mint=per_mint,
+    )
 
 @app.post("/v1/mint/quote", response_model=MintQuoteResp)
 async def mint_quote(req: MintQuoteReq):
@@ -119,19 +160,43 @@ async def mint_quote(req: MintQuoteReq):
         mint_url=mint_url, quote=q.quote, request=q.request, amount=req.amount, unit=u.name
     )
 
-@app.post("/v1/mint/execute")
+@app.post("/v1/mint/execute", response_model=MintExecuteResp)
 async def mint_execute(req: MintExecuteReq):
     u = Unit[req.unit]
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)
     await w.load_mint()
-    # Pull quote details from mint (Wallet.get_mint_quote exists) :contentReference[oaicite:8]{index=8}
+
     q = await w.get_mint_quote(req.quote)
     if not q.paid:
-        # If you prefer, you can return q.state and let LNBits poll.
-        raise HTTPException(status_code=409, detail="mint quote not paid")
-    await w.mint(q.amount, quote_id=q.quote)  # mints proofs into DB
-    return {"ok": True}
+        return MintExecuteResp(
+            mint_url=mint_url,
+            quote=req.quote,
+            status="pending",
+            paid=False,
+        )
+
+    await w.mint(q.amount, quote_id=q.quote)
+    return MintExecuteResp(
+        mint_url=mint_url,
+        quote=req.quote,
+        status="paid",
+        paid=True,
+    )
+
+@app.post("/v1/mint/status", response_model=MintStatusResp)
+async def mint_status(req: MintStatusReq):
+    u = Unit[req.unit]
+    mint_url = req.mint_url or _default_mint()
+    w = await _wallet_for(mint_url, u)
+    await w.load_mint()
+    q = await w.get_mint_quote(req.quote)
+    # q.paid exists (you already use it in mint_execute)
+    status = "paid" if q.paid else "pending"
+    # if q has a state field, prefer it:
+    if getattr(q, "state", None):
+        status = str(q.state)
+    return MintStatusResp(paid=bool(q.paid), status=status, failed=status in {"failed","expired","canceled"})
 
 @app.post("/v1/melt/quote", response_model=MeltQuoteResp)
 async def melt_quote(req: MeltQuoteReq):
@@ -155,15 +220,57 @@ async def melt_execute(req: MeltExecuteReq):
     await w.load_mint()
     await w.load_proofs(reload=True)
 
-    total = req.fee_reserve  # fee_reserve is in sats; you’ll add amount via quote or external
-    # In CLI, total_amount is amount + fee_reserve. :contentReference[oaicite:9]{index=9}
-    # Here we assume caller already computed/validated total coverage using melt_quote.amount.
-    # If you want, re-fetch melt quote from mint and compute total here.
+    get_melt = getattr(w, "get_melt_quote", None)
+    if not get_melt:
+        raise HTTPException(status_code=501, detail="Wallet has no get_melt_quote(); needed for amount lookup")
+    mq = await get_melt(req.quote)
+
+    amount = int(getattr(mq, "amount", 0))
+    total = amount + int(req.fee_reserve)
 
     send_proofs, _fees = await w.select_to_send(w.proofs, total, set_reserved=True)
+
     resp = await w.melt(send_proofs, req.invoice, req.fee_reserve, req.quote)
 
-    # melt() writes fee_paid to DB as amount + fee_paid - change. :contentReference[oaicite:10]{index=10}
-    paid = True  # if melt() didn’t raise and wasn’t pending/unpaid
-    return MeltExecuteResp(mint_url=req.mint_url, quote=req.quote, paid=paid)
+    fee_paid = getattr(resp, "fee_paid", None) or getattr(mq, "fee_paid", None)
+    preimage = getattr(resp, "preimage", None) or getattr(resp, "payment_preimage", None)
+
+    return MeltExecuteResp(
+        mint_url=req.mint_url,
+        quote=req.quote,
+        status="paid",
+        paid=True,
+        fee_paid_sat=fee_paid_sat,
+        preimage=preimage,
+    )
+
+@app.post("/v1/melt/status", response_model=MeltStatusResp)
+async def melt_status(req: MeltStatusReq):
+    u = Unit[req.unit]
+    mint_url = req.mint_url or _default_mint()
+    w = await _wallet_for(mint_url, u)
+    await w.load_mint()
+
+    # Prefer a "get_melt_quote" style method if it exists.
+    get_melt = getattr(w, "get_melt_quote", None)
+    if not get_melt:
+        raise HTTPException(status_code=501, detail="Wallet has no get_melt_quote(); implement melt status lookup")
+
+    mq = await get_melt(req.quote)
+
+    paid = bool(getattr(mq, "paid", False))
+    status = "paid" if paid else "pending"
+    if getattr(mq, "state", None):
+        status = str(mq.state)
+
+    fee_paid = getattr(mq, "fee_paid", None)
+    preimage = getattr(mq, "preimage", None) or getattr(mq, "payment_preimage", None)
+
+    return MeltStatusResp(
+        paid=paid,
+        status=status,
+        failed=status in {"failed","expired","canceled"},
+        fee_paid_sat=int(fee_paid) if fee_paid is not None else None,
+        preimage=str(preimage) if preimage is not None else None,
+    )
 
