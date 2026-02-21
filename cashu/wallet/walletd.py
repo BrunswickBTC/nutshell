@@ -215,13 +215,13 @@ async def mint_execute(req: MintExecuteReq):
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)
 
+    # Always start from fresh local view
     await _refresh_mint_state(w)
-    await w.load_proofs(reload=True)  # fine to keep
+    await w.load_proofs(reload=True)
 
-    await w.load_mint()
-
+    # Confirm paid
     q = await w.get_mint_quote(req.quote)
-    if not q.paid:
+    if not getattr(q, "paid", False):
         return MintExecuteResp(
             mint_url=mint_url,
             quote=req.quote,
@@ -229,8 +229,30 @@ async def mint_execute(req: MintExecuteReq):
             paid=False,
         )
 
-    await w.mint(q.amount, quote_id=q.quote)
+    async def _do_mint():
+        # Make sure mint/keysets are current immediately before minting outputs
+        await _refresh_mint_state(w)
+        await w.mint(init(q.amount), quote_id=str(q.quote))
 
+    try:
+        await _do_mint()
+    except Exception as e:
+        msg = str(e)
+
+        # Handle the exact class/message variants you've observed
+        is_keyset_unknown = ("keyset id unknown" in msg.lower()) or ("11000" in msg)
+
+        if not is_keyset_unknown:
+            raise
+
+        # One forced refresh + single retry
+        await _refresh_mint_state(w)
+        await _do_mint()
+
+    # Now that mint succeeded, update local proofs/balance view
+    await w.load_proofs(reload=True)
+
+    # Only mark claimed after successful mint
     await _mark_claimed(w.db, mint_url, req.unit, req.quote, int(time.time()))
 
     return MintExecuteResp(
@@ -246,28 +268,25 @@ async def mint_status(req: MintStatusReq):
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)
     await w.load_mint()
-    q = await w.get_mint_quote(req.quote)
-    # q.paid exists (you already use it in mint_execute)
-    status = "paid" if q.paid else "pending"
-    # if q has a state field, prefer it:
-    if getattr(q, "state", None):
-        status = str(q.state)
+    # q = await w.get_mint_quote(req.quote)
 
-    mint_paid = (q.state == "paid")
+    claimed = await _is_claimed(w.db, mint_url, req.unit, req.quote)
 
-    claimed = await is_mint_claimed(w.db, mint_url, req.quote)
+    state_str = str(getattr(q, "state", "")) if getattr(q, "state", None) else ""
+    mint_paid = (state_str == "paid)
 
     if claimed:
         status = "paid"
         paid = True
     elif mint_paid:
-        status = "claimable"
+        # status = "claimable"
+        status = "pending"
         paid = False
     else:
         status = "pending"
         paid = False
 
-    return MintStatusResp(paid=bool(q.paid), status=status, failed=status in {"failed","expired","canceled"})
+    return MintStatusResp(paid=paid, status=status, failed=status in {"failed","expired","canceled"})
 
 @app.post("/v1/melt/quote", response_model=MeltQuoteResp)
 async def melt_quote(req: MeltQuoteReq):
