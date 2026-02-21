@@ -157,20 +157,40 @@ async def _ensure_claims_table(db):
     except Exception:
         pass
 
-async def _mark_claimed(db, mint_url: str, unit: str, quote: str, ts: int):
+CLAIMS_UPSERT_SQL = """
+INSERT INTO minted_claims (mint_url, unit, quote, claimed_time)
+VALUES (:mint_url, :unit, :quote, :claimed_time)
+ON CONFLICT(mint_url, unit, quote)
+DO UPDATE SET claimed_time = excluded.claimed_time
+"""
+
+async def _mark_claimed(db, mint_url: str, unit: str, quote: str, claimed_time: int) -> None:
     await _ensure_claims_table(db)
     await db.execute(
-        "INSERT OR REPLACE INTO walletd_claims (mint_url, unit, quote, claimed_time) VALUES (?, ?, ?, ?)",
-        (mint_url, unit, quote, ts),
+        CLAIMS_UPSERT_SQL,
+        {
+            "mint_url": mint_url,
+            "unit": unit,
+            "quote": quote,
+            "claimed_time": claimed_time,
+        },
     )
+
+CLAIMS_SELECT_SQL = """
+SELECT claimed_time
+FROM minted_claims
+WHERE mint_url = :mint_url AND unit = :unit AND quote = :quote
+LIMIT 1
+"""
 
 async def _is_claimed(db, mint_url: str, unit: str, quote: str) -> bool:
     await _ensure_claims_table(db)
     row = await db.fetchone(
-        "SELECT 1 FROM walletd_claims WHERE mint_url = ? AND unit = ? AND quote = ? LIMIT 1",
-        (mint_url, unit, quote),
+        CLAIMS_SELECT_SQL,
+        {"mint_url": mint_url, "unit": unit, "quote": quote},
     )
-    return bool(row)
+    return row is not None
+
 
 # --------- endpoints ---------
 
