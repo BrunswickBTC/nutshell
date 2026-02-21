@@ -5,7 +5,7 @@ import time
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .wallet import Wallet
 from ..core.base import Unit
@@ -28,7 +28,7 @@ class BalanceResp(BaseModel):
 
 class MintQuoteReq(BaseModel):
     amount: int
-    unit: str = "sat"
+    unit: str = Field(default="sat")
     mint_url: Optional[str] = None
     memo: Optional[str] = None
 
@@ -41,7 +41,7 @@ class MintQuoteResp(BaseModel):
 
 class MintExecuteReq(BaseModel):
     quote: str
-    unit: str = "sat"
+    unit: str = Field(default="sat")
     mint_url: Optional[str] = None
 
 class MintExecuteResp(BaseModel):
@@ -52,7 +52,7 @@ class MintExecuteResp(BaseModel):
 
 class MeltQuoteReq(BaseModel):
     invoice: str
-    unit: str = "sat"
+    unit: str = Field(default="sat")
     mint_url: Optional[str] = None
 
 class MeltQuoteResp(BaseModel):
@@ -66,7 +66,7 @@ class MeltExecuteReq(BaseModel):
     invoice: str
     quote: str
     fee_reserve: int
-    unit: str = "sat"
+    unit: str = Field(default="sat")
     mint_url: str
 
 class MeltExecuteResp(BaseModel):
@@ -79,18 +79,18 @@ class MeltExecuteResp(BaseModel):
 
 class MintStatusReq(BaseModel):
     quote: str
-    unit: str = "sat"
     mint_url: Optional[str] = None
+    unit: str = Field(default="sat")
 
 class MintStatusResp(BaseModel):
     paid: bool
-    status: str
+    status: str # "paid" | "claimable" | "failed" | "expired" | "canceled" | "pending"
     failed: bool = False
 
 class MeltStatusReq(BaseModel):
     quote: str
-    unit: str = "sat"
     mint_url: Optional[str] = None
+    unit: str = Field(default="sat")
 
 class MeltStatusResp(BaseModel):
     paid: bool
@@ -109,8 +109,7 @@ def _default_mint() -> str:
     # Match CLI default host
     return settings.mint_url
 
-async def _wallet_for(mint_url: str, unit: Unit) -> Wallet:
-    # Match CLI init: run migrations first, then load wallet normally.
+async def _wallet_for(mint_url: str, unit: Unit, *, load_all_keysets: bool = True) -> Wallet:
     db_path = _db_path()
     wallet_name = settings.wallet_name
 
@@ -120,34 +119,20 @@ async def _wallet_for(mint_url: str, unit: Unit) -> Wallet:
         name=wallet_name,
         unit=unit.name,
         skip_db_read=False,
-        load_all_keysets=True,
+        load_all_keysets=load_all_keysets,
     )
-    if not w.mint_info:
+    if not getattr(w, "mint_info", None):
         await w.load_mint()
     return w
 
-async def _refresh_mint_state(w):
-    await w.load_mint()
-
-    # try the likely refresh methods across versions
-    for name in ("load_keysets", "load_keys", "load_mint_keys", "load_mint_keysets"):
-        fn = getattr(w, name, None)
-        if fn:
-            try:
-                # some variants accept reload=True
-                await fn(reload=True)
-            except TypeError:
-                await fn()
-
-# walletd_claims: quote claimed locally (proofs minted + stored)
 CLAIMS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS walletd_claims (
-  mint_url TEXT NOT NULL,
-  unit     TEXT NOT NULL,
-  quote    TEXT NOT NULL,
-  claimed_time INTEGER NOT NULL,
-  PRIMARY KEY (mint_url, unit, quote)
-);
+CREATE TABLE IF NOT EXISTS minted_claims (
+    mint_url TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    quote TEXT NOT NULL,
+    claimed_time INTEGER NOT NULL,
+    PRIMARY KEY (mint_url, unit, quote)
+)
 """
 
 async def _ensure_claims_table(db):
@@ -195,7 +180,7 @@ async def _is_claimed(db, mint_url: str, unit: str, quote: str) -> bool:
 # --------- endpoints ---------
 
 @app.get("/v1/balance", response_model=BalanceResp)
-async def balance(unit: Optional[str] = None):
+async def balance_uds(unit: Optional[str] = None):
     u = Unit[unit or settings.wallet_unit]
     w = await _wallet_for(_default_mint(), u)
     await w.load_proofs(reload=True, all_keysets=True)
@@ -213,7 +198,7 @@ async def balance(unit: Optional[str] = None):
     )
 
 @app.post("/v1/mint/quote", response_model=MintQuoteResp)
-async def mint_quote(req: MintQuoteReq):
+async def mint_quote_uds(req: MintQuoteReq):
     u = Unit[req.unit]
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)
@@ -223,50 +208,123 @@ async def mint_quote(req: MintQuoteReq):
         mint_url=mint_url, quote=q.quote, request=q.request, amount=req.amount, unit=u.name
     )
 
+
 @app.post("/v1/mint/execute", response_model=MintExecuteResp)
-async def mint_execute(req: MintExecuteReq):
+async def mint_execute_uds(req: MintExecuteReq):
     u = Unit[req.unit]
     mint_url = req.mint_url or _default_mint()
-    w = await _wallet_for(mint_url, u)
+    w = await _wallet_for(mint_url, u, load_all_keysets=False)
 
-    # Always start from fresh local view
-    await _refresh_mint_state(w)
-    await w.load_proofs(reload=True)
+    async def _refresh_keysets(wallet: Wallet):
+        # Always reload mint info + keysets immediately before minting outputs
+        await wallet.load_mint()
+        for name in ("load_keysets", "load_keys", "load_mint_keys", "load_mint_keysets"):
+            fn = getattr(wallet, name, None)
+            if not fn:
+                continue
+            try:
+                await fn(reload=True)
+            except TypeError:
+                await fn()
+            return
 
-    # Confirm paid
-    q = await w.get_mint_quote(req.quote)
-    if not getattr(q, "paid", False):
+    async def _load_proofs_all(wallet: Wallet):
+        # Handle signature drift across versions
+        try:
+            await wallet.load_proofs(reload=True, all_keysets=True)
+        except TypeError:
+            try:
+                await wallet.load_proofs(reload=True)
+            except TypeError:
+                await wallet.load_proofs()
+
+    async def _get_quote(wallet: Wallet, quote_id: str, unit: Unit):
+        # Nutshell version drift: some require (quote, unit), some (quote)
+        for args in ((quote_id, unit), (quote_id,)):
+            try:
+                return await wallet.get_mint_quote(*args)
+            except TypeError:
+                continue
+        # re-raise the last TypeError (or whatever happened)
+        return await wallet.get_mint_quote(quote_id)
+
+    def _quote_keyset_id(qobj) -> str | None:
+        return (
+            getattr(qobj, "keyset", None)
+            or getattr(qobj, "keyset_id", None)
+            or getattr(qobj, "keysetid", None)
+        )
+
+    async def _bind_keyset(wallet: Wallet, qobj):
+        ks = _quote_keyset_id(qobj)
+        if not ks:
+            return
+        # Best-effort across versions
+        if hasattr(wallet, "keyset_id"):
+            wallet.keyset_id = ks
+        set_keyset = getattr(wallet, "set_keyset", None)
+        if set_keyset:
+            try:
+                await set_keyset(ks)
+            except TypeError:
+                set_keyset(ks)
+
+    async def _mint_paid_quote(wallet: Wallet, amount: int, quote_id: str):
+        # Version drift: some use quote_id=, some quote=
+        for kwargs in ({"quote_id": quote_id}, {"quote": quote_id}):
+            try:
+                return await wallet.mint(amount, **kwargs)
+            except TypeError:
+                continue
+        return await wallet.mint(amount, quote_id=quote_id)
+
+    # Fresh view
+    await _refresh_keysets(w)
+    await _load_proofs_all(w)
+
+    q = await _get_quote(w, req.quote, u)
+
+    state = str(getattr(q, "state", "") or "").lower()
+    paid = bool(getattr(q, "paid", False)) or (state == "paid")
+
+    if not paid:
         return MintExecuteResp(
             mint_url=mint_url,
             quote=req.quote,
-            status="pending",
+            status=(state or "pending"),
             paid=False,
         )
 
-    async def _do_mint():
-        # Make sure mint/keysets are current immediately before minting outputs
-        await _refresh_mint_state(w)
-        await w.mint(int(q.amount), quote_id=str(q.quote))
+    amount = int(getattr(q, "amount", 0) or 0)
+    if amount <= 0:
+        # fallback fields some versions use
+        amount = int(getattr(q, "quote_amount", 0) or 0)
+
+    # IMPORTANT: bind wallet to quote’s keyset (if mint provides it)
+    await _bind_keyset(w, q)
+
+    quote_id = str(getattr(q, "quote", None) or getattr(q, "id", None) or req.quote)
 
     try:
-        await _do_mint()
+        # Mint proofs for the paid quote
+        await _refresh_keysets(w)
+        await _bind_keyset(w, q)
+        await _mint_paid_quote(w, amount, quote_id)
+
     except Exception as e:
-        msg = str(e)
-
-        # Handle the exact class/message variants you've observed
-        is_keyset_unknown = ("keyset id unknown" in msg.lower()) or ("11000" in msg)
-
-        if not is_keyset_unknown:
+        msg = str(e).lower()
+        if ("keyset id unknown" not in msg) and ("11000" not in msg):
             raise
 
-        # One forced refresh + single retry
-        await _refresh_mint_state(w)
-        await _do_mint()
+        # One forced refresh + re-fetch quote + re-bind keyset + retry
+        await _refresh_keysets(w)
+        q2 = await _get_quote(w, req.quote, u)
+        await _bind_keyset(w, q2)
+        quote_id2 = str(getattr(q2, "quote", None) or getattr(q2, "id", None) or req.quote)
+        amount2 = int(getattr(q2, "amount", amount) or amount)
+        await _mint_paid_quote(w, amount2, quote_id2)
 
-    # Now that mint succeeded, update local proofs/balance view
-    await w.load_proofs(reload=True)
-
-    # Only mark claimed after successful mint
+    await _load_proofs_all(w)
     await _mark_claimed(w.db, mint_url, req.unit, req.quote, int(time.time()))
 
     return MintExecuteResp(
@@ -276,8 +334,9 @@ async def mint_execute(req: MintExecuteReq):
         paid=True,
     )
 
+
 @app.post("/v1/mint/status", response_model=MintStatusResp)
-async def mint_status(req: MintStatusReq):
+async def mint_status_uds(req: MintStatusReq):
     u = Unit[req.unit]
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)
@@ -303,7 +362,7 @@ async def mint_status(req: MintStatusReq):
 
 
 @app.post("/v1/melt/quote", response_model=MeltQuoteResp)
-async def melt_quote(req: MeltQuoteReq):
+async def melt_quote_uds(req: MeltQuoteReq):
     u = Unit[req.unit]
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)
@@ -319,9 +378,9 @@ async def melt_quote(req: MeltQuoteReq):
 
 
 @app.post("/v1/melt/execute", response_model=MeltExecuteResp)
-async def melt_execute(req: MeltExecuteReq):
+async def melt_execute_uds(req: MeltExecuteReq):
     u = Unit[req.unit]
-    w = await _wallet_for(req.mint_url, u)
+    w = await _wallet_for(req.mint_url, u, load_all_keysets=False)
     await w.load_mint()
     await w.load_proofs(reload=True)
 
@@ -370,7 +429,7 @@ async def melt_execute(req: MeltExecuteReq):
 
 
 @app.post("/v1/melt/status", response_model=MeltStatusResp)
-async def melt_status(req: MeltStatusReq):
+async def melt_status_uds(req: MeltStatusReq):
     u = Unit[req.unit]
     mint_url = req.mint_url or _default_mint()
     w = await _wallet_for(mint_url, u)

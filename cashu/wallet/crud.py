@@ -455,20 +455,24 @@ async def get_bolt11_melt_quotes(
     return [MeltQuote.from_row(r) for r in rows]  # type: ignore
 
 
-async def get_bolt11_melt_quote_row(db, quote: str) -> Optional[Dict[str, Any]]:
-    # works with the DB wrapper used in nutshell (db.fetch_one pattern)
-    row = await db.fetch_one(
-        """
-        SELECT quote, amount, state, fee_paid, payment_preimage
-        FROM bolt11_melt_quotes
-        WHERE quote = :quote
-        """,
-        {"quote": quote},
-    )
-    if not row:
+async def _db_fetch_one(db, query: str, values: dict):
+    if hasattr(db, "fetch_one"):      # databases.Database
+        return await db.fetch_one(query=query, values=values)
+    if hasattr(db, "fetchone"):       # nutshell db wrapper
+        return await db.fetchone(query, values)
+    raise TypeError(f"Unsupported db object: {type(db)}")
+
+async def get_bolt11_melt_quote_row(db, quote: str):
+    q = """
+    SELECT * FROM bolt11_melt_quotes
+    WHERE quote = :quote
+    LIMIT 1
+    """
+    row = await _db_fetch_one(db, q, {"quote": quote})
+    if row is None:
         return None
-    # row may be Mapping-like depending on your DB layer
-    return dict(row)
+    # normalize row to dict across drivers
+    return dict(row) if not isinstance(row, dict) else row
 
 
 async def update_bolt11_melt_quote(
