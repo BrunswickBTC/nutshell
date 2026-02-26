@@ -647,7 +647,7 @@ async def melt_quote_uds(req: MeltQuoteReq):
 async def melt_execute_uds(req: MeltExecuteReq):
 
     def _resp_from_melt(melt_map: MeltMapResp) -> "MeltExecuteResp":
-        status, paid = _status_from_state((getattr(melt_map, "state", "") or "").upper())
+        status, paid = _status_from_state(melt_map.state)
 
         return MeltExecuteResp(
             mint_url=melt_map.mint_url,
