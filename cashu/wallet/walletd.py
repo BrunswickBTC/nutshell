@@ -205,7 +205,7 @@ async def _is_claimed(db: Database, mint_url: str, unit: str, quote: str) -> boo
 
 # ------ MELT DATABASE ------
 
-#EXECUTION_STALE_SECS = 120  # tune
+EXECUTION_STALE_SECS = getattr(settings, "walletd_execution_stale_secs", 300)
 TTL_SUCCESS_SECS = 30 * 24 * 3600
 TTL_FAIL_SECS = 7 * 24 * 3600
 
@@ -648,7 +648,7 @@ async def mint_status_uds(req: MintStatusReq):
     q = await w.get_mint_quote(req.quote)
 
     db = app.state.db
-    claimed = await _is_claimed(db, mint_url, req.unit, req.quote)
+    claimed = await _is_claimed(db, mint_url, u.name, req.quote)
 
     state = str(getattr(q, "state", "") or "")
     state_l = state.lower()
@@ -721,11 +721,12 @@ async def melt_execute_uds(req: MeltExecuteReq):
 
     # 3) Acquire execution lock (prevents double spend / double reserve)
     acquired = await _melt_try_lock(db, req.payment_hash)
+    melt_map = await _get_melt_map_by_hash(db, req.payment_hash) # get new melt_map immediately after _melt_try_lock()
+    if not melt_map:
+        raise HTTPException(status_code=404, detail="Unknown payment_hash")
+    if melt_map.state in ("SUCCEEDED", "FAILED", "CANCELED"):
+        return _resp_from_melt(melt_map)
     if not acquired:
-        # Someone else is executing, or it already became terminal; re-read and return current view
-        melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
-        if not melt_map:
-            raise HTTPException(status_code=404, detail="Unknown payment_hash")
         return _resp_from_melt(melt_map)
 
     # 5) Use server-authoritative terms from melt_map (do NOT call get_melt_quote)
@@ -846,9 +847,9 @@ async def melt_status_uds(payment_hash: str):
 
     # 3) EXECUTING: if not stale, return pending
     now = int(time.time())
-    started = int(melt_map.executing_started_at or 0)
-    EXECUTION_STALE_SECS = getattr(settings, "walletd_execution_stale_secs", 300)
-    if started and (now - started) < EXECUTION_STALE_SECS:
+
+    started = melt_map.executing_started_at
+    if started is not None and (now - started) < EXECUTION_STALE_SECS:
         return MeltStatusResp(
             payment_hash=payment_hash,
             mint_url=melt_map.mint_url,
