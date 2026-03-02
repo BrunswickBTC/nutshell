@@ -314,7 +314,7 @@ async def _store_melt_map(
          "PENDING", now, now),
     )
 
-async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> MeltMapResp:
+async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> Optional[MeltMapResp]:
     def _rget(row, key, default=None):
         try:
             return row[key]
@@ -350,6 +350,12 @@ async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> MeltMapResp:
 # - You have a way to update melts by payment_hash in your DB layer (implemented below as helper calls)
 
 async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
+    def _rget(row, key, default=None):
+        try:
+            return row[key]
+        except Exception:
+            return getattr(row, key, default)
+
     """
     Atomically transition PENDING -> EXECUTING.
     Returns True if this call acquired execution, False otherwise.
@@ -381,13 +387,15 @@ async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
             "SELECT state FROM melt_map WHERE payment_hash = ?",
             (payment_hash,),
         )
-        return bool(row and (row["state"] == "EXECUTING"))
+        #return bool(row and (row["state"] == "EXECUTING"))
+        st = row["state"] if isinstance(row, dict) else getattr(row, "state", None)
+        return bool(st == "EXECUTING")
     return rowcount > 0
 
 
-async def _melt_set_succeeded(db: Database, payment_hash: str, preimage: str, fee_paid_sat: Optional[int] = None) -> None:
+async def _melt_set_succeeded(db: Database, payment_hash: str, preimage: Optional[str], fee_paid_sat: Optional[int] = None) -> None:
     now = int(time.time())
-    gc_after = now + 30 * 24 * 3600  # 30d; tune
+    gc_after = now + TTL_SUCCESS_SECS
 
     await db.execute(
         """
@@ -408,7 +416,7 @@ async def _melt_set_succeeded(db: Database, payment_hash: str, preimage: str, fe
 
 async def _melt_set_failed(db: Database, payment_hash: str, code: str, detail: str) -> None:
     now = int(time.time())
-    gc_after = now + 7 * 24 * 3600  # 7d; tune
+    gc_after = now + TTL_FAIL_SECS
 
     await db.execute(
         """
@@ -427,50 +435,11 @@ async def _melt_set_failed(db: Database, payment_hash: str, code: str, detail: s
     )
 
 
-async def _terminalize_succeeded(db: Database, payment_hash: str, preimage: str | None, fee_paid_sat: int | None = None):
-    now = int(time.time())
-    gc_after = now + TTL_SUCCESS_SECS
-    await db.execute(
-        """
-        UPDATE melt_map
-        SET state='SUCCEEDED',
-            preimage=?,
-            fee_paid_sat=COALESCE(?, fee_paid_sat),
-            completed_at=?,
-            gc_after=?,
-            updated_at=?,
-            executing_lock_id=NULL,
-            executing_started_at=NULL
-        WHERE payment_hash=?
-        """,
-        (preimage, fee_paid_sat, now, gc_after, now, payment_hash),
-    )
-
-
-async def _terminalize_failed(db: Database, payment_hash: str, code: str, detail: str | None = None):
-    now = int(time.time())
-    gc_after = now + TTL_FAIL_SECS
-    await db.execute(
-        """
-        UPDATE melt_map
-        SET state='FAILED',
-            failure_code=?,
-            failure_detail=?,
-            completed_at=?,
-            gc_after=?,
-            updated_at=?,
-            executing_lock_id=NULL,
-            executing_started_at=NULL
-        WHERE payment_hash=?
-        """,
-        (code, (detail or "")[:2048], now, gc_after, now, payment_hash),
-    )
-
-
 def _normalize_melt_result(
     melt_map: MeltMapResp,
     melt_quote: PostMeltQuoteResponse,
-) -> Dict[str, Optional[int]]:
+) -> Dict[str, Any]:
+#) -> Dict[str, Optional[int]]:
     """
     Returns normalized values:
         {
@@ -688,7 +657,8 @@ async def mint_status_uds(req: MintStatusReq):
 
     q = await w.get_mint_quote(req.quote)
 
-    claimed = await _is_claimed(w.db, mint_url, req.unit, req.quote)
+    db = app.state.db
+    claimed = await _is_claimed(db, mint_url, req.unit, req.quote)
 
     state = str(getattr(q, "state", "") or "")
     state_l = state.lower()
@@ -812,6 +782,11 @@ async def melt_execute_uds(req: MeltExecuteReq):
         # terminal failure
         await _melt_set_failed(db, req.payment_hash, "MELT_NOT_PAID", f"state={state_u}")
     elif "PENDING" == state_u:
+        await db.execute(
+            "UPDATE melt_map SET updated_at=? WHERE payment_hash=?",
+            (int(time.time()), req.payment_hash),
+        )
+
         # leave EXECUTING (do not fail)
         pass
     else:
@@ -926,14 +901,14 @@ async def melt_status_uds(payment_hash: str):
 
     # 5) Terminalize only when proven
     if qs == "PAID":
-        await _terminalize_succeeded(
+        await _melt_set_succeeded(
             db,
             payment_hash,
             norm["preimage"],
             fee_paid_sat=norm["fee_paid_sat"],
         )
     elif qs == "UNPAID":
-        await _terminalize_failed(
+        await _melt_set_failed(
             db,
             payment_hash,
             "RECONCILED_UNPAID",
