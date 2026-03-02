@@ -5,7 +5,6 @@ import time, secrets
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
-from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 
 from .wallet import Wallet
@@ -14,25 +13,29 @@ from ..core.settings import settings
 from ..core.db import Database
 from ..core.models import PostMeltQuoteResponse
 
-#from .crud import get_bolt11_melt_quote_row
 
+app = FastAPI(title="nutshell-walletd", version="0.1")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+@app.on_event("startup")
+async def _startup():
     # ---- INIT CODE ----
     app.state.db = Database(settings.wallet_name, _db_path())
-    await app.state.db.connect()
-
+    #await app.state.db.connect()
     await _ensure_melts_table(app.state.db)
     await _ensure_claims_table(app.state.db)
 
-    yield
 
-    # ---- SHUTDOWN CODE ----
-    await app.state.db.close()
+@app.on_event("shutdown")
+async def _shutdown():
+    # optional: only if Database exposes a real coroutine close/dispose
+    close = getattr(app.state.db, "close", None)
+    if close and callable(close):
+        res = close()
+        # if close is a coroutine, await it; if it's a contextmanager, do nothing
+        import inspect
+        if inspect.isawaitable(res):
+            await res
 
-
-app = FastAPI(title="nutshell-walletd", version="0.1", lifespan=lifespan)
 
 # --------- request/response models ---------
 
@@ -353,6 +356,11 @@ async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> Optional[Mel
 # - You have a way to update melts by payment_hash in your DB layer (implemented below as helper calls)
 
 async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
+    def _rget(r, k, default=None):
+        try:
+            return r[k]
+        except Exception:
+            return getattr(r, k, default)
     """
     Atomically transition PENDING -> EXECUTING.
     Returns True if this call acquired execution, False otherwise.
@@ -376,11 +384,21 @@ async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
     )
     # Normalize "rows affected"
     rowcount = getattr(res, "rowcount", None)
-    if rowcount is None and isinstance(res, int):
-        rowcount = res
-    if rowcount is None:
+    if isinstance(rowcount, int) and rowcount >= 0:
+        return rowcount > 0
+
+    # Fallback: verify by reading back the lock_id we wrote
+    row = await db.fetchone(
+        "SELECT state, executing_lock_id FROM melt_map WHERE payment_hash=?",
+        (payment_hash,),
+    )
+    if not row:
         return False
-    return rowcount > 0
+
+    state = str(_rget(row, "state", "") or "").upper()
+    got_lock = _rget(row, "executing_lock_id", None)
+
+    return state == "EXECUTING" and got_lock == lock_id
 
 
 async def _melt_set_succeeded(db: Database, payment_hash: str, preimage: Optional[str], fee_paid_sat: Optional[int] = None) -> None:
