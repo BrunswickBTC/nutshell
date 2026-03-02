@@ -5,16 +5,34 @@ import time, secrets
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 
 from .wallet import Wallet
 from ..core.base import Unit
 from ..core.settings import settings
 from ..core.db import Database
+from ..core.models import PostMeltQuoteResponse
 
-from .crud import get_bolt11_melt_quote_row
+#from .crud import get_bolt11_melt_quote_row
 
-app = FastAPI(title="nutshell-walletd", version="0.1")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- INIT CODE ----
+    app.state.db = Database(settings.wallet_name, _db_path())
+    await app.state.db.connect()
+
+    await _ensure_melts_table(app.state.db)
+    await _ensure_claims_table(app.state.db)
+
+    yield
+
+    # ---- SHUTDOWN CODE ----
+    await app.state.db.close()
+
+
+app = FastAPI(title="nutshell-walletd", version="0.1", lifespan=lifespan)
 
 # --------- request/response models ---------
 
@@ -96,11 +114,14 @@ class MeltStatusReq(BaseModel):
     #unit: str = Field(default="sat")
 
 class MeltStatusResp(BaseModel):
+    mint_url: str
+    quote: str
+    status: str  # "paid" | "pending" | "failed"
     paid: bool
-    status: str
-    failed: bool = False
     fee_paid_sat: Optional[int] = None
     preimage: Optional[str] = None
+    payment_hash: str
+    state: str
 
 # --------- wallet construction helpers ---------
 
@@ -142,12 +163,8 @@ CREATE TABLE IF NOT EXISTS minted_claims (
 )
 """
 
-async def _ensure_claims_table(db):
-    # best-effort idempotent
-    try:
-        await db.execute(CLAIMS_TABLE_SQL)
-    except Exception:
-        pass
+async def _ensure_claims_table(db: Database):
+    await db.execute(CLAIMS_TABLE_SQL)
 
 
 CLAIMS_UPSERT_SQL = """
@@ -157,8 +174,8 @@ ON CONFLICT(mint_url, unit, quote)
 DO UPDATE SET claimed_time = excluded.claimed_time
 """
 
-async def _mark_claimed(db, mint_url: str, unit: str, quote: str, claimed_time: int) -> None:
-    await _ensure_claims_table(db)
+async def _mark_claimed(db: Database, mint_url: str, unit: str, quote: str, claimed_time: int) -> None:
+    #await _ensure_claims_table(db)
     await db.execute(
         CLAIMS_UPSERT_SQL,
         {
@@ -177,8 +194,8 @@ WHERE mint_url = :mint_url AND unit = :unit AND quote = :quote
 LIMIT 1
 """
 
-async def _is_claimed(db, mint_url: str, unit: str, quote: str) -> bool:
-    await _ensure_claims_table(db)
+async def _is_claimed(db: Database, mint_url: str, unit: str, quote: str) -> bool:
+    #await _ensure_claims_table(db)
     row = await db.fetchone(
         CLAIMS_SELECT_SQL,
         {"mint_url": mint_url, "unit": unit, "quote": quote},
@@ -192,7 +209,7 @@ EXECUTION_STALE_SECS = 120  # tune
 TTL_SUCCESS_SECS = 30 * 24 * 3600
 TTL_FAIL_SECS = 7 * 24 * 3600
 
-def _status_from_state(state: str) -> tuple[str, bool]:
+def _status_from_state(state: str) -> tuple[str, bool]: # returns tuple (status, paid)
     s = (state or "").upper()
     if s == "SUCCEEDED":
         return "paid", True
@@ -204,15 +221,6 @@ def _status_from_state(state: str) -> tuple[str, bool]:
         return "pending", False
     return (state or "pending").lower(), False
 
-
-async def _walletd_db():
-    # Your known-good construction:
-    db_path = _db_path()  # directory path
-    wallet_name = settings.wallet_name
-    db = Database(wallet_name, db_path)
-    await db.connect()
-
-    return db
 
 
 MELTS_TABLE_SQL_STMTS = [
@@ -261,49 +269,76 @@ class MeltMapResp(BaseModel):
     #gc_after: int
 
     #executing_lock_id: str
-    executing_started_at: int
+    executing_started_at: Optional[int] = None
 
-    preimage: str
-    fee_paid_sat: int
+    preimage: Optional[str] = None
+    fee_paid_sat: Optional[int] = None
     #failure_code: str
     #failure_detail: str
 
-async def _ensure_melts_table(db):
+async def _ensure_melts_table(db: Database):
     for stmt in MELTS_TABLE_SQL_STMTS:
         await db.execute(stmt)
 
-async def _store_melt_map(payment_hash, mint_url, unit, amount, fee_reserve, quote, bolt11): # bolt11 a.k.a. invoice
-    db = await _walletd_db()
-
-    await _ensure_melts_table(db)
+async def _store_melt_map(
+    db: Database,
+    payment_hash: str,
+    mint_url: str,
+    unit: str,
+    quote: str,
+    bolt11: str,
+    amount: int,
+    fee_reserve: int,
+) -> None:
+    #await _ensure_melts_table(db)
+    now = int(time.time())
     await db.execute(
         """
-        INSERT OR REPLACE INTO melt_map(payment_hash, mint_url, unit, amount, fee_reserve, quote, bolt11, state, created_at)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        INSERT INTO melt_map(
+            payment_hash, mint_url, unit, quote, bolt11,
+            amount, fee_reserve,
+            state, created_at, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(payment_hash) DO UPDATE SET
+            mint_url=excluded.mint_url,
+            unit=excluded.unit,
+            quote=excluded.quote,
+            bolt11=excluded.bolt11,
+            amount=excluded.amount,
+            fee_reserve=excluded.fee_reserve,
+            updated_at=excluded.updated_at
         """,
-        (payment_hash, mint_url, unit, amount, fee_reserve, quote, bolt11, "PENDING", int(time.time()))
+        (payment_hash, mint_url, unit, quote, bolt11,
+         int(amount), int(fee_reserve),
+         "PENDING", now, now),
     )
 
-async def _get_melt_map_by_hash(payment_hash: str) -> MeltMapResp:
-    db = await _walletd_db()
-    await _ensure_melts_table(db)
+async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> MeltMapResp:
+    def _rget(row, key, default=None):
+        try:
+            return row[key]
+        except Exception:
+            return getattr(row, key, default)
+
+    #await _ensure_melts_table(db)
     row = await db.fetchone(
-        "SELECT mint_url, unit, quote, bolt11 FROM melt_map WHERE payment_hash=?",
+        "SELECT * FROM melt_map WHERE payment_hash=?",
         (payment_hash,)
     )
     if not row: return None
-
+    fee_paid = _rget(row, "fee_paid_sat", None)
     return MeltMapResp(
-        mint_url=getattr(row,    "mint_url", None),
-        unit=getattr(row,        "unit", None),
-        quote=getattr(row,       "quote", None),
-        bolt11=getattr(row,      "bolt11", None), # a.k.a. invoice
-        amount=int(getattr(row,      "amount", 0)),
-        fee_reserve=int(getattr(row, "fee_reserve", 0)),
-        state=getattr(row,       "state", "").toupper(),
-        executing_started_at=getattr(row, "executing_started_at", None),
-        preimage=getattr(row,    "preimage", None),
-        fee_paid_sat=int(getattr(row, "fee_paid_sat", None)),
+        mint_url=_rget(row,    "mint_url"),
+        unit=_rget(row,        "unit"),
+        quote=_rget(row,       "quote"),
+        bolt11=_rget(row,      "bolt11"), # a.k.a. invoice
+        amount=int(_rget(row,      "amount", 0) or 0),
+        fee_reserve=int(_rget(row, "fee_reserve", 0) or 0),
+        state=str(_rget(row,       "state", "PENDING") or "PENDING").upper(),
+        executing_started_at=int(_rget(row, "executing_started_at", 0) or 0),
+        preimage=_rget(row,    "preimage", None),
+        fee_paid_sat=None if fee_paid is None else int(fee_paid),
     )
 
 # Assumptions:
@@ -314,12 +349,11 @@ async def _get_melt_map_by_hash(payment_hash: str) -> MeltMapResp:
 # - You have Database available as in your snippet: Database(wallet_name, db_path)
 # - You have a way to update melts by payment_hash in your DB layer (implemented below as helper calls)
 
-async def _melt_try_lock(payment_hash: str) -> bool:
+async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
     """
     Atomically transition PENDING -> EXECUTING.
     Returns True if this call acquired execution, False otherwise.
     """
-    db = await _walletd_db()
     now = int(time.time())
     lock_id = secrets.token_hex(16)
 
@@ -351,8 +385,7 @@ async def _melt_try_lock(payment_hash: str) -> bool:
     return rowcount > 0
 
 
-async def _melt_set_succeeded(payment_hash: str, preimage: str, fee_paid_sat: Optional[int] = None) -> None:
-    db = await _walletd_db()
+async def _melt_set_succeeded(db: Database, payment_hash: str, preimage: str, fee_paid_sat: Optional[int] = None) -> None:
     now = int(time.time())
     gc_after = now + 30 * 24 * 3600  # 30d; tune
 
@@ -373,8 +406,7 @@ async def _melt_set_succeeded(payment_hash: str, preimage: str, fee_paid_sat: Op
     )
 
 
-async def _melt_set_failed(payment_hash: str, code: str, detail: str) -> None:
-    db = await _walletd_db()
+async def _melt_set_failed(db: Database, payment_hash: str, code: str, detail: str) -> None:
     now = int(time.time())
     gc_after = now + 7 * 24 * 3600  # 7d; tune
 
@@ -395,8 +427,7 @@ async def _melt_set_failed(payment_hash: str, code: str, detail: str) -> None:
     )
 
 
-async def _terminalize_succeeded(payment_hash: str, preimage: str | None, fee_paid_sat: int | None = None):
-    db = await _walletd_db()
+async def _terminalize_succeeded(db: Database, payment_hash: str, preimage: str | None, fee_paid_sat: int | None = None):
     now = int(time.time())
     gc_after = now + TTL_SUCCESS_SECS
     await db.execute(
@@ -416,8 +447,7 @@ async def _terminalize_succeeded(payment_hash: str, preimage: str | None, fee_pa
     )
 
 
-async def _terminalize_failed(payment_hash: str, code: str, detail: str | None = None):
-    db = await _walletd_db()
+async def _terminalize_failed(db: Database, payment_hash: str, code: str, detail: str | None = None):
     now = int(time.time())
     gc_after = now + TTL_FAIL_SECS
     await db.execute(
@@ -437,7 +467,60 @@ async def _terminalize_failed(payment_hash: str, code: str, detail: str | None =
     )
 
 
+def _normalize_melt_result(
+    melt_map: MeltMapResp,
+    melt_quote: PostMeltQuoteResponse,
+) -> Dict[str, Optional[int]]:
+    """
+    Returns normalized values:
+        {
+            "amount_sat": int,
+            "fee_paid_sat": Optional[int],     # routing fee only
+            "total_spent_sat": Optional[int],  # amount + fee - change
+            "preimage": Optional[str],
+            "state": str,                      # PAID|PENDING|UNPAID|UNKNOWN
+        }
+    """
+
+    # ---- authoritative amount ----
+    amount = int(getattr(melt_map, "amount", 0) or 0)
+
+    # ---- normalize state ----
+    state_u = ((getattr(melt_quote, "state", None) or "")
+               .strip()
+               .upper())
+
+    # ---- preimage ----
+    preimage = getattr(melt_quote, "payment_preimage", None)
+
+    # ---- fee normalization ----
+    raw_fee_paid = getattr(melt_quote, "fee_paid", None)
+
+    fee_only = None
+    total_spent = None
+
+    if raw_fee_paid is not None:
+        raw_fee_paid = int(raw_fee_paid)
+
+        # Case A: upstream stored total consumed (>= amount)
+        if raw_fee_paid >= amount:
+            total_spent = raw_fee_paid
+            fee_only = raw_fee_paid - amount
+
+        # Case B: upstream stored fee-only (< amount)
+        else:
+            fee_only = raw_fee_paid
+            total_spent = amount + raw_fee_paid
+
+    return {
+        "amount_sat": amount,
+        "fee_paid_sat": fee_only,
+        "total_spent_sat": total_spent,
+        "preimage": preimage,
+        "state": state_u or "UNKNOWN",
+    }
 # --------- endpoints ---------
+
 
 @app.get("/v1/balance", response_model=BalanceResp)
 async def balance_uds(unit: Optional[str] = None):
@@ -585,7 +668,8 @@ async def mint_execute_uds(req: MintExecuteReq):
         await _mint_paid_quote(w, amount2, quote_id2)
 
     await _load_proofs_all(w)
-    await _mark_claimed(w.db, mint_url, req.unit, req.quote, int(time.time()))
+    db = app.state.db
+    await _mark_claimed(db, mint_url, req.unit, req.quote, int(time.time()))
 
     return MintExecuteResp(
         mint_url=mint_url,
@@ -630,7 +714,8 @@ async def melt_quote_uds(req: MeltQuoteReq):
     await w.load_mint()
     mq = await w.melt_quote(req.invoice)
 
-    await _store_melt_map(payment_hash=req.payment_hash, mint_url=mint_url, unit=u.name, aount=mq.amount, fee_reserve=mq.fee_reserve, quote=mq.quote, bolt11=req.invoice)
+    db = app.state.db
+    await _store_melt_map(db, payment_hash=req.payment_hash, mint_url=mint_url, unit=u.name, amount=mq.amount, fee_reserve=mq.fee_reserve, quote=mq.quote, bolt11=req.invoice)
 
     return MeltQuoteResp(
         mint_url=mint_url,
@@ -657,14 +742,15 @@ async def melt_execute_uds(req: MeltExecuteReq):
             fee_paid_sat=melt_map.fee_paid_sat,
             preimage=melt_map.preimage
         )
+    db = app.state.db
 
     # 1) Load lifecycle record by payment_hash (DB-only; no Wallet needed)
-    melt_map = await _get_melt_map_by_hash(req.payment_hash)
+    melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
     if not melt_map:
         raise HTTPException(status_code=404, detail="Unknown payment_hash")
 
     # 2) Idempotency: if terminal, return immediately
-    state = melt_map.state.upper()
+    state = melt_map.state
     if state in ("SUCCEEDED", "FAILED", "CANCELED"):
         return _resp_from_melt(melt_map)
 
@@ -674,10 +760,10 @@ async def melt_execute_uds(req: MeltExecuteReq):
     invoice = melt_map.bolt11
 
     # 3) Acquire execution lock (prevents double spend / double reserve)
-    acquired = await _melt_try_lock(req.payment_hash)
+    acquired = await _melt_try_lock(db, req.payment_hash)
     if not acquired:
         # Someone else is executing, or it already became terminal; re-read and return current view
-        melt_map = await _get_melt_map_by_hash(req.payment_hash)
+        melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
         if not melt_map:
             raise HTTPException(status_code=404, detail="Unknown payment_hash")
         return _resp_from_melt(melt_map)
@@ -686,16 +772,16 @@ async def melt_execute_uds(req: MeltExecuteReq):
     amount = melt_map.amount
     fee_reserve = melt_map.fee_reserve
     if amount <= 0:
-        await _melt_set_failed(req.payment_hash, "MISSING_AMOUNT", "melt record missing amount")
-        melt_map = await _get_melt_map_by_hash(req.payment_hash)
+        await _melt_set_failed(db, req.payment_hash, "MISSING_AMOUNT", "melt record missing amount")
+        melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
         return _resp_from_melt(melt_map)
 
     total = amount + fee_reserve
 
     # Optional: ignore client-provided fee reserve; if you want strictness, reject mismatch instead.
     # if hasattr(req, "fee_reserve") and req.fee_reserve is not None and int(req.fee_reserve) != fee_reserve:
-    #     await _melt_set_failed(req.payment_hash, "FEE_MISMATCH", "client fee_reserve mismatch")
-    #     melt_map = await _get_melt_map_by_hash(req.payment_hash)
+    #     await _melt_set_failed(db, req.payment_hash, "FEE_MISMATCH", "client fee_reserve mismatch")
+    #     melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
     #     return _resp_from_melt(melt_map)
 
     # 5) Execute: reserve proofs, melt, then terminalize lifecycle record
@@ -711,81 +797,44 @@ async def melt_execute_uds(req: MeltExecuteReq):
     except Exception as e:
         # Best-effort unreserve: only if your Wallet exposes it. If not, you need a separate cleanup path.
         # Example (if exists): await w.unreserve_proofs(send_proofs)
-        await _melt_set_failed(req.payment_hash, "MELT_EXCEPTION", repr(e))
-        melt_map = await _get_melt_map_by_hash(req.payment_hash)
+        await _melt_set_failed(db, req.payment_hash, "MELT_EXCEPTION", repr(e))
+        melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
         return _resp_from_melt(melt_map)
 
+    normalized = _normalize_melt_result(melt_map, resp)
+
     # 6) Determine success from response; persist terminal truth keyed by payment_hash
-    resp_state = (getattr(resp, "state", "") or "").lower()
-    paid = resp_state == "paid" or resp_state == "succeeded"
-
-    if paid:
-        preimage = getattr(resp, "payment_preimage", None)
-        if not preimage:
-            # If Nutshell response sometimes omits it, you can optionally read back from wallet tables here.
-            # But lifecycle record remains authoritative; preimage can remain NULL if unavailable.
-            preimage = None
-
-        # If you can reliably extract fee paid from resp, set it; else omit.
-        fee_paid_sat = getattr(resp, "fee_paid_sat", None)
-
-        await _melt_set_succeeded(req.payment_hash, preimage or "", fee_paid_sat=fee_paid_sat)
+    state_u = ((resp.state or "").strip().upper())
+    if "PAID" == state_u:
+        # terminal success
+        await _melt_set_succeeded(db, req.payment_hash, normalized["preimage"], fee_paid_sat=normalized["fee_paid_sat"])
+    elif "UNPAID" == state_u:
+        # terminal failure
+        await _melt_set_failed(db, req.payment_hash, "MELT_NOT_PAID", f"state={state_u}")
+    elif "PENDING" == state_u:
+        # leave EXECUTING (do not fail)
+        pass
     else:
-        # include any error-ish fields you can extract from resp
-        detail = getattr(resp, "error", None) or getattr(resp, "message", None) or f"state={resp_state}"
-        await _melt_set_failed(req.payment_hash, "MELT_NOT_PAID", str(detail))
+        # unknown -> conservative failure
+        await _melt_set_failed(db, req.payment_hash, "UNKNOWN_QUOTE_STATE", f"state={state_u}")
 
     # 7) Return from lifecycle record (idempotent truth)
-    melt_map = await _get_melt_map_by_hash(req.payment_hash)
+    melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
     if not melt_map:
         raise HTTPException(status_code=404, detail="Unknown payment_hash")
     return _resp_from_melt(melt_map)
 
 
+
 @app.get("/v1/melt/status/{payment_hash}", response_model=MeltStatusResp)
 async def melt_status_uds(payment_hash: str):
-    async def _reconcile_from_wallet_quote(w, quote: str):
-        """
-        Fallback reconciliation: read wallet bookkeeping (not proofs spending).
-        Uses get_melt_quote if available; returns (state, preimage, fee_paid_sat) or (None, None, None) if unknown.
-        """
-        get_melt = getattr(w, "get_melt_quote", None)
-        if not get_melt:
-            return None, None, None
+    db = app.state.db
 
-        mq = await get_melt(quote)
-
-        # Normalize state
-        mq_state = (getattr(mq, "state", None) or "").lower()
-
-        # preimage may be on mq or nested
-        preimage = getattr(mq, "payment_preimage", None) or getattr(mq, "preimage", None)
-
-        # fee paid extraction is version-dependent; keep as best-effort
-        fee_paid_sat = getattr(mq, "fee_paid_sat", None)
-        if fee_paid_sat is None:
-            # Some schemas store total fee_paid (amount+fee). If you have amount in melt_map you can compute,
-            # but keep it optional here.
-            fee_paid_total = getattr(mq, "fee_paid", None)
-            if fee_paid_total is not None:
-                try:
-                    fee_paid_sat = int(fee_paid_total)
-                except Exception:
-                    fee_paid_sat = None
-
-        return mq_state, preimage, fee_paid_sat
-
-    """
-    Read-mostly status endpoint with bounded reconciliation:
-    - Never selects proofs
-    - Never calls w.melt()
-    - May terminalize stale EXECUTING melts if it can prove outcome
-    """
-    melt_map = await _get_melt_map_by_hash(payment_hash)
+    melt_map = await _get_melt_map_by_hash(db, payment_hash)
     if not melt_map:
         raise HTTPException(status_code=404, detail="Unknown payment_hash")
 
-    state = melt_map.state.upper()
+    state = (melt_map.state or "PENDING").upper()
 
     # 1) Terminal: return immediately
     if state in ("SUCCEEDED", "FAILED", "CANCELED"):
@@ -796,8 +845,8 @@ async def melt_status_uds(payment_hash: str):
             quote=melt_map.quote,
             status=status,
             paid=paid,
-            fee_paid_sat=melt_map.fee_paid_sat
-            preimage=melt_map.preimage
+            fee_paid_sat=melt_map.fee_paid_sat,
+            preimage=melt_map.preimage,
             state=state.lower(),
         )
 
@@ -815,7 +864,7 @@ async def melt_status_uds(payment_hash: str):
             state=state.lower(),
         )
 
-    # 3) EXECUTING: if not stale, return "pending"
+    # 3) EXECUTING: if not stale, return pending
     now = int(time.time())
     started = int(melt_map.executing_started_at or 0)
     if started and (now - started) < EXECUTION_STALE_SECS:
@@ -830,17 +879,40 @@ async def melt_status_uds(payment_hash: str):
             state="executing",
         )
 
-    # 4) Stale EXECUTING: attempt bounded reconciliation using wallet bookkeeping
-    #    (Best is LN backend query by ln_payment_id; fallback shown here.)
+    # 4) Stale EXECUTING: attempt bounded reconciliation (READ-ONLY)
     try:
         u = Unit[melt_map.unit]
         w = await _wallet_for(melt_map.mint_url, u, load_all_keysets=False)
         await w.load_mint()
-        # IMPORTANT: do NOT load proofs, do NOT reserve, do NOT melt
 
-        mq_state, preimage, fee_paid_sat = await _reconcile_from_wallet_quote(w, melt_map.quote)
-    except Exception as e:
-        # If we can't reconcile, return pending; do not change lifecycle state.
+        get_melt = getattr(w, "get_melt_quote", None)
+        if not get_melt:
+            # Can't reconcile: return pending
+            return MeltStatusResp(
+                payment_hash=payment_hash,
+                mint_url=melt_map.mint_url,
+                quote=melt_map.quote,
+                status="pending",
+                paid=False,
+                fee_paid_sat=None,
+                preimage=None,
+                state="executing",
+            )
+
+        mq = await get_melt(melt_map.quote)
+
+        # Normalize mq into PostMeltQuoteResponse shape if it's a MeltQuote
+        if isinstance(mq, PostMeltQuoteResponse):
+            quote_resp = mq
+        else:
+            # Most likely mq is MeltQuote; convert using the classmethod you showed
+            quote_resp = PostMeltQuoteResponse.from_melt_quote(mq)
+
+        norm = _normalize_melt_result(melt_map, quote_resp)
+        qs = norm["state"]  # "PAID" | "PENDING" | "UNPAID" | "UNKNOWN"
+
+    except Exception:
+        # Any failure to reconcile: stay executing
         return MeltStatusResp(
             payment_hash=payment_hash,
             mint_url=melt_map.mint_url,
@@ -852,12 +924,23 @@ async def melt_status_uds(payment_hash: str):
             state="executing",
         )
 
-    if mq_state in ("paid", "succeeded", "settled"):
-        await _terminalize_succeeded(payment_hash, preimage, fee_paid_sat=fee_paid_sat)
-    elif mq_state in ("failed", "canceled", "unpaid", "expired"):
-        await _terminalize_failed(payment_hash, "RECONCILED_FAIL", f"wallet quote state={mq_state}")
+    # 5) Terminalize only when proven
+    if qs == "PAID":
+        await _terminalize_succeeded(
+            db,
+            payment_hash,
+            norm["preimage"],
+            fee_paid_sat=norm["fee_paid_sat"],
+        )
+    elif qs == "UNPAID":
+        await _terminalize_failed(
+            db,
+            payment_hash,
+            "RECONCILED_UNPAID",
+            "wallet quote state=UNPAID",
+        )
     else:
-        # Unknown/indeterminate: keep EXECUTING
+        # PENDING/UNKNOWN: keep EXECUTING
         return MeltStatusResp(
             payment_hash=payment_hash,
             mint_url=melt_map.mint_url,
@@ -869,9 +952,9 @@ async def melt_status_uds(payment_hash: str):
             state="executing",
         )
 
-    # 5) Return terminalized record
-    melt_map2 = await _get_melt_map_by_hash(payment_hash)
-    state2 = melt_map2.state
+    # 6) Return terminalized record
+    melt_map2 = await _get_melt_map_by_hash(db, payment_hash)
+    state2 = (melt_map2.state or "PENDING").upper()
     status, paid = _status_from_state(state2)
     return MeltStatusResp(
         payment_hash=payment_hash,
@@ -879,8 +962,7 @@ async def melt_status_uds(payment_hash: str):
         quote=melt_map2.quote,
         status=status,
         paid=paid,
-        fee_paid_sat=melt_map2.fee_paid_sat
-        preimage=melt_map2.preimage
+        fee_paid_sat=melt_map2.fee_paid_sat,
+        preimage=melt_map2.preimage,
         state=state2.lower(),
     )
-
