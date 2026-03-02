@@ -205,7 +205,7 @@ async def _is_claimed(db: Database, mint_url: str, unit: str, quote: str) -> boo
 
 # ------ MELT DATABASE ------
 
-EXECUTION_STALE_SECS = 120  # tune
+#EXECUTION_STALE_SECS = 120  # tune
 TTL_SUCCESS_SECS = 30 * 24 * 3600
 TTL_FAIL_SECS = 7 * 24 * 3600
 
@@ -327,7 +327,10 @@ async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> Optional[Mel
         (payment_hash,)
     )
     if not row: return None
+
     fee_paid = _rget(row, "fee_paid_sat", None)
+    started_raw = _rget(row, "executing_started_at", None)
+    executing_started_at = int(started_raw) if started_raw else None
     return MeltMapResp(
         mint_url=_rget(row,    "mint_url"),
         unit=_rget(row,        "unit"),
@@ -336,7 +339,7 @@ async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> Optional[Mel
         amount=int(_rget(row,      "amount", 0) or 0),
         fee_reserve=int(_rget(row, "fee_reserve", 0) or 0),
         state=str(_rget(row,       "state", "PENDING") or "PENDING").upper(),
-        executing_started_at=int(_rget(row, "executing_started_at", 0) or 0),
+        executing_started_at=executing_started_at,
         preimage=_rget(row,    "preimage", None),
         fee_paid_sat=None if fee_paid is None else int(fee_paid),
     )
@@ -350,12 +353,6 @@ async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> Optional[Mel
 # - You have a way to update melts by payment_hash in your DB layer (implemented below as helper calls)
 
 async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
-    def _rget(row, key, default=None):
-        try:
-            return row[key]
-        except Exception:
-            return getattr(row, key, default)
-
     """
     Atomically transition PENDING -> EXECUTING.
     Returns True if this call acquired execution, False otherwise.
@@ -382,14 +379,7 @@ async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
     if rowcount is None and isinstance(res, int):
         rowcount = res
     if rowcount is None:
-        # Fallback: query state to infer
-        row = await db.fetchone(
-            "SELECT state FROM melt_map WHERE payment_hash = ?",
-            (payment_hash,),
-        )
-        #return bool(row and (row["state"] == "EXECUTING"))
-        st = row["state"] if isinstance(row, dict) else getattr(row, "state", None)
-        return bool(st == "EXECUTING")
+        return False
     return rowcount > 0
 
 
@@ -638,7 +628,7 @@ async def mint_execute_uds(req: MintExecuteReq):
 
     await _load_proofs_all(w)
     db = app.state.db
-    await _mark_claimed(db, mint_url, req.unit, req.quote, int(time.time()))
+    await _mark_claimed(db, mint_url, u.name, req.quote, int(time.time()))
 
     return MintExecuteResp(
         mint_url=mint_url,
@@ -765,9 +755,20 @@ async def melt_execute_uds(req: MeltExecuteReq):
     try:
         resp = await w.melt(send_proofs, invoice, fee_reserve, quote)
     except Exception as e:
-        # Best-effort unreserve: only if your Wallet exposes it. If not, you need a separate cleanup path.
-        # Example (if exists): await w.unreserve_proofs(send_proofs)
-        await _melt_set_failed(db, req.payment_hash, "MELT_EXCEPTION", repr(e))
+        # Attempt proof unreserve if supported
+        unreserve = getattr(w, "unreserve_proofs", None)
+        if unreserve:
+            try:
+                await unreserve(send_proofs)
+            except Exception:
+                pass  # do not mask original failure
+    
+        await _melt_set_failed(
+            db,
+            req.payment_hash,
+            "MELT_EXCEPTION",
+            repr(e),
+        )
         melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
         return _resp_from_melt(melt_map)
 
@@ -790,8 +791,12 @@ async def melt_execute_uds(req: MeltExecuteReq):
         # leave EXECUTING (do not fail)
         pass
     else:
-        # unknown -> conservative failure
-        await _melt_set_failed(db, req.payment_hash, "UNKNOWN_QUOTE_STATE", f"state={state_u}")
+        # Unknown state — do NOT terminalize.
+        # Leave EXECUTING and allow stale reconciliation to decide.
+        await db.execute(
+            "UPDATE melt_map SET updated_at=? WHERE payment_hash=?",
+            (int(time.time()), req.payment_hash),
+        )
 
     # 7) Return from lifecycle record (idempotent truth)
     melt_map = await _get_melt_map_by_hash(db, req.payment_hash)
@@ -842,6 +847,7 @@ async def melt_status_uds(payment_hash: str):
     # 3) EXECUTING: if not stale, return pending
     now = int(time.time())
     started = int(melt_map.executing_started_at or 0)
+    EXECUTION_STALE_SECS = getattr(settings, "walletd_execution_stale_secs", 300)
     if started and (now - started) < EXECUTION_STALE_SECS:
         return MeltStatusResp(
             payment_hash=payment_hash,
@@ -886,7 +892,18 @@ async def melt_status_uds(payment_hash: str):
         norm = _normalize_melt_result(melt_map, quote_resp)
         qs = norm["state"]  # "PAID" | "PENDING" | "UNPAID" | "UNKNOWN"
 
-    except Exception:
+    except Exception as e:
+        await db.execute(
+            """
+            UPDATE melt_map
+            SET failure_detail = ?,
+                updated_at = ?
+            WHERE payment_hash = ?
+              AND state = 'EXECUTING'
+            """,
+            (f"RECONCILE_ERROR: {repr(e)[:512]}", int(time.time()), payment_hash),
+        )
+
         # Any failure to reconcile: stay executing
         return MeltStatusResp(
             payment_hash=payment_hash,
