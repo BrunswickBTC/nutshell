@@ -13,7 +13,7 @@ from ..core.settings import settings
 from ..core.db import Database
 from ..core.models import PostMeltQuoteResponse
 
-from lnbits import bolt11 as bolt11_util
+import bolt11
 
 app = FastAPI(title="nutshell-walletd", version="0.1")
 
@@ -497,7 +497,7 @@ async def balance_uds(unit: Optional[str] = None):
     u = Unit[unit or settings.wallet_unit]
     w = await _wallet_for(_default_mint(), u)
     await w.load_proofs(reload=True, all_keysets=True)
-    per_mint = await w.balance_per_minturl(unit=u.name)  # dict keyed by minturl
+    per_mint = await w.balance_per_minturl(unit=u)  # dict keyed by minturl
     total_avail = sum(int(v.get("available", 0)) for v in (per_mint or {}).values())
 
     default_mint = _default_mint()
@@ -686,7 +686,9 @@ async def melt_quote_uds(req: MeltQuoteReq):
     mint_url = req.mint_url or _default_mint()
     u = Unit[req.unit]
     w = await _wallet_for(mint_url, u)
-    payment_hash=bolt11_util.decode(req.invoice).payment_hash
+    decoded=bolt11.decode(req.invoice)
+    payment_hash= decoded.payment_hash.lower()
+    assert len(payment_hash) == 64
 
     await w.load_mint()
     mq = await w.melt_quote(req.invoice)
