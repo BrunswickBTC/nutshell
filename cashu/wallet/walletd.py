@@ -171,7 +171,6 @@ DO UPDATE SET claimed_time = excluded.claimed_time
 """
 
 async def _mark_claimed(db: Database, mint_url: str, unit: str, quote: str, claimed_time: int) -> None:
-    #await _ensure_claims_table(db)
     await db.execute(
         CLAIMS_UPSERT_SQL,
         {
@@ -191,7 +190,6 @@ LIMIT 1
 """
 
 async def _is_claimed(db: Database, mint_url: str, unit: str, quote: str) -> bool:
-    #await _ensure_claims_table(db)
     row = await db.fetchone(
         CLAIMS_SELECT_SQL,
         {"mint_url": mint_url, "unit": unit, "quote": quote},
@@ -280,28 +278,38 @@ async def _store_melt_map(
     amount: int,
     fee_reserve: int,
 ) -> None:
-    #await _ensure_melts_table(db)
     now = int(time.time())
     await db.execute(
         """
         INSERT INTO melt_map(
             payment_hash, mint_url, unit, quote, bolt11,
-            amount, fee_reserve,
-            state, created_at, updated_at
+            amount, fee_reserve, state, created_at, updated_at
         )
-        VALUES(?,?,?,?,?,?,?,?,?,?)
+        VALUES(
+            :payment_hash, :mint_url, :unit, :quote, :bolt11,
+            :amount, :fee_reserve, :state, :created_at, :updated_at
+        )
         ON CONFLICT(payment_hash) DO UPDATE SET
-            mint_url=excluded.mint_url,
-            unit=excluded.unit,
-            quote=excluded.quote,
-            bolt11=excluded.bolt11,
-            amount=excluded.amount,
-            fee_reserve=excluded.fee_reserve,
-            updated_at=excluded.updated_at
+            mint_url = excluded.mint_url,
+            unit = excluded.unit,
+            quote = excluded.quote,
+            bolt11 = excluded.bolt11,
+            amount = excluded.amount,
+            fee_reserve = excluded.fee_reserve,
+            updated_at = excluded.updated_at
         """,
-        (payment_hash, mint_url, unit, quote, bolt11,
-         int(amount), int(fee_reserve),
-         "PENDING", now, now),
+        {
+            "payment_hash": payment_hash,
+            "mint_url": mint_url,
+            "unit": unit,
+            "quote": quote,
+            "bolt11": bolt11,
+            "amount": int(amount),
+            "fee_reserve": int(fee_reserve),
+            "state": "PENDING",
+            "created_at": now,
+            "updated_at": now,
+        },
     )
 
 async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> Optional[MeltMapResp]:
@@ -311,11 +319,11 @@ async def _get_melt_map_by_hash(db: Database, payment_hash: str) -> Optional[Mel
         except Exception:
             return getattr(row, key, default)
 
-    #await _ensure_melts_table(db)
     row = await db.fetchone(
-        "SELECT * FROM melt_map WHERE payment_hash=?",
-        (payment_hash,)
+        "SELECT * FROM melt_map WHERE payment_hash = :payment_hash",
+        {"payment_hash": payment_hash},
     )
+
     if not row: return None
 
     fee_paid = _rget(row, "fee_paid_sat", None)
@@ -362,14 +370,20 @@ async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
         """
         UPDATE melt_map
         SET state = 'EXECUTING',
-            executing_lock_id = ?,
-            executing_started_at = ?,
-            updated_at = ?
-        WHERE payment_hash = ?
+            executing_lock_id = :lock_id,
+            executing_started_at = :executing_started_at,
+            updated_at = :updated_at
+        WHERE payment_hash = :payment_hash
           AND state = 'PENDING'
         """,
-        (lock_id, now, now, payment_hash),
+        {
+            "lock_id": lock_id,
+            "executing_started_at": now,
+            "updated_at": now,
+            "payment_hash": payment_hash,
+        },
     )
+
     # Normalize "rows affected"
     rowcount = getattr(res, "rowcount", None)
     if isinstance(rowcount, int) and rowcount >= 0:
@@ -377,9 +391,10 @@ async def _melt_try_lock(db: Database, payment_hash: str) -> bool:
 
     # Fallback: verify by reading back the lock_id we wrote
     row = await db.fetchone(
-        "SELECT state, executing_lock_id FROM melt_map WHERE payment_hash=?",
-        (payment_hash,),
+        "SELECT state, executing_lock_id FROM melt_map WHERE payment_hash = :payment_hash",
+        {"payment_hash": payment_hash},
     )
+
     if not row:
         return False
 
