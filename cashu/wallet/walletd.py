@@ -412,16 +412,16 @@ async def _melt_set_succeeded(db: Database, payment_hash: str, preimage: Optiona
         """
         UPDATE melt_map
         SET state = 'SUCCEEDED',
-            preimage = ?,
-            fee_paid_sat = COALESCE(?, fee_paid_sat),
-            completed_at = ?,
-            gc_after = ?,
-            updated_at = ?,
+            preimage = :preimage,
+            fee_paid_sat = COALESCE(:fee_paid_sat, fee_paid_sat),
+            completed_at = :completed_at,
+            gc_after = :gc_after,
+            updated_at = :updated_at,
             executing_lock_id = NULL,
             executing_started_at = NULL
-        WHERE payment_hash = ?
+        WHERE payment_hash = :payment_hash
         """,
-        (preimage, fee_paid_sat, now, gc_after, now, payment_hash),
+        { "preimage": preimage, "fee_paid_sat": fee_paid_sat, "completed_at": now, "gc_after": gc_after, "updated_at": now, "payment_hash": payment_hash},
     )
 
 
@@ -433,16 +433,16 @@ async def _melt_set_failed(db: Database, payment_hash: str, code: str, detail: s
         """
         UPDATE melt_map
         SET state = 'FAILED',
-            failure_code = ?,
-            failure_detail = ?,
-            completed_at = ?,
-            gc_after = ?,
-            updated_at = ?,
+            failure_code = :failure_code,
+            failure_detail = :failure_detail,
+            completed_at = :completed_at,
+            gc_after = :gc_after,
+            updated_at = :updated_at,
             executing_lock_id = NULL,
             executing_started_at = NULL
-        WHERE payment_hash = ?
+        WHERE payment_hash = :payment_hash
         """,
-        (code, detail[:2048], now, gc_after, now, payment_hash),
+        {"failure_code": code, "failure_detail": detail[:2048], "completed_at": now, "gc_after": gc_after, "updated_at": now, "payment_hash": payment_hash},
     )
 
 
@@ -826,8 +826,8 @@ async def melt_execute_uds(req: MeltExecuteReq):
         await _melt_set_failed(db, req.payment_hash, "MELT_NOT_PAID", f"state={state_u}")
     elif "PENDING" == state_u:
         await db.execute(
-            "UPDATE melt_map SET updated_at=? WHERE payment_hash=?",
-            (int(time.time()), req.payment_hash),
+            "UPDATE melt_map SET updated_at=:updated_at WHERE payment_hash=:payment_hash",
+            {"updated_at": int(time.time()), "payment_hash": req.payment_hash},
         )
 
         # leave EXECUTING (do not fail)
@@ -836,8 +836,8 @@ async def melt_execute_uds(req: MeltExecuteReq):
         # Unknown state — do NOT terminalize.
         # Leave EXECUTING and allow stale reconciliation to decide.
         await db.execute(
-            "UPDATE melt_map SET updated_at=? WHERE payment_hash=?",
-            (int(time.time()), req.payment_hash),
+            "UPDATE melt_map SET updated_at=:updated_at WHERE payment_hash=:payment_hash",
+            {"updated_at": int(time.time()), "payment_hash": req.payment_hash},
         )
 
     # 7) Return from lifecycle record (idempotent truth)
@@ -929,12 +929,12 @@ async def melt_status_uds(payment_hash: str):
         await db.execute(
             """
             UPDATE melt_map
-            SET failure_detail = ?,
-                updated_at = ?
-            WHERE payment_hash = ?
+            SET failure_detail = :failure_detail,
+                updated_at = :updated_at
+            WHERE payment_hash = :payment_hash
               AND state = 'EXECUTING'
             """,
-            (f"RECONCILE_ERROR: {repr(e)[:512]}", int(time.time()), payment_hash),
+            (f"RECONCILE_ERROR: {"failure_detail": repr(e)[:512]}", "updated_at": int(time.time()), "payment_hash": payment_hash},
         )
 
         # Any failure to reconcile: stay executing
