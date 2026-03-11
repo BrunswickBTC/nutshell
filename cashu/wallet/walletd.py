@@ -934,7 +934,8 @@ async def melt_status_uds(payment_hash: str):
             WHERE payment_hash = :payment_hash
               AND state = 'EXECUTING'
             """,
-            (f"RECONCILE_ERROR: {"failure_detail": repr(e)[:512]}", "updated_at": int(time.time()), "payment_hash": payment_hash},
+            #(                  f"RECONCILE_ERROR: {repr(e)[:512]}",               int(time.time()),                 payment_hash),
+            { "failure_detail": f"RECONCILE_ERROR: {repr(e)[:512]}", "updated_at": int(time.time()), "payment_hash": payment_hash},
         )
 
         # Any failure to reconcile: stay executing
