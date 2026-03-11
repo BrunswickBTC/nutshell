@@ -21,7 +21,7 @@ app = FastAPI(title="nutshell-walletd", version="0.1")
 async def _startup():
     # ---- INIT CODE ----
     app.state.db = Database(settings.wallet_name, _db_path())
-    #await app.state.db.connect()
+    app.state.wallet_cache = {}
     await _ensure_melts_table(app.state.db)
     await _ensure_claims_table(app.state.db)
 
@@ -131,6 +131,8 @@ def _default_mint() -> str:
     return settings.mint_url
 
 # --------- wallet helpers ---------
+
+"""
 async def _wallet_for(mint_url: str, unit: Unit, *, load_all_keysets: bool = True) -> Wallet:
     db_path = _db_path()
     wallet_name = settings.wallet_name
@@ -146,6 +148,46 @@ async def _wallet_for(mint_url: str, unit: Unit, *, load_all_keysets: bool = Tru
     if not getattr(w, "mint_info", None):
         await w.load_mint()
     return w
+"""
+
+async def _wallet_for(
+    mint_url: str,
+    unit: Unit,
+    *,
+    load_all_keysets: bool = True,
+    ensure_mint_loaded: bool = True,
+) -> Wallet:
+    cache = app.state.wallet_cache
+    key = (mint_url, unit.name, bool(load_all_keysets))
+
+    if key in cache:
+        w = cache[key]
+    else:
+        w = await Wallet.with_db(
+            url=mint_url,
+            db=_db_path(),
+            name=settings.wallet_name,
+            unit=unit.name,
+            skip_db_read=False,
+            load_all_keysets=load_all_keysets,
+        )
+        cache[key] = w
+
+    if ensure_mint_loaded and not getattr(w, "mint_info", None):
+        await w.load_mint()
+
+    return w
+
+
+async def _get_mint_quote_safe(wallet: Wallet, quote_id: str, unit: Unit):
+    for args in ((quote_id, unit), (quote_id,)):
+        try:
+            return await wallet.get_mint_quote(*args)
+        except TypeError:
+            continue
+        except Exception:
+            raise
+    return await wallet.get_mint_quote(quote_id)
 
 
 # -------- CLAIMS DATABASE --------
@@ -665,18 +707,9 @@ async def mint_execute_uds(req: MintExecuteReq):
 async def mint_status_uds(req: MintStatusReq):
     mint_url = req.mint_url or _default_mint()
     u = Unit[req.unit]
-    w = await _wallet_for(mint_url, u)
-    await w.load_mint()
-
-    q = await w.get_mint_quote(req.quote)
-
     db = app.state.db
+
     claimed = await _is_claimed(db, mint_url, u.name, req.quote)
-
-    state = str(getattr(q, "state", "") or "")
-    state_l = state.lower()
-
-    # If we've already minted proofs locally, it's settled from walletd's perspective.
     if claimed:
         return MintStatusResp(
             mint_url=mint_url,
@@ -685,7 +718,48 @@ async def mint_status_uds(req: MintStatusReq):
             status="paid",
         )
 
-    # Mint says invoice is paid, but we have not claimed proofs yet.
+    w = await _wallet_for(
+        mint_url,
+        u,
+        load_all_keysets=False,
+        ensure_mint_loaded=False,
+    )
+
+    try:
+        q = await _get_mint_quote_safe(w, req.quote, u)
+    except Exception as e:
+        msg = str(e).lower()
+
+        # transient upstream throttle: do not 500 the status endpoint
+        if "rate limit" in msg:
+            return MintStatusResp(
+                mint_url=mint_url,
+                unit=u.name,
+                quote=req.quote,
+                status="pending",
+            )
+
+        # if wallet state seems stale, do one refresh and retry once
+        refresh_markers = ("unknown keyset", "mint info", "not loaded")
+        if any(m in msg for m in refresh_markers):
+            try:
+                await w.load_mint()
+                q = await _get_mint_quote_safe(w, req.quote, u)
+            except Exception as e2:
+                msg2 = str(e2).lower()
+                if "rate limit" in msg2:
+                    return MintStatusResp(
+                        mint_url=mint_url,
+                        unit=u.name,
+                        quote=req.quote,
+                        status="pending",
+                    )
+                raise
+        else:
+            raise
+
+    state_l = str(getattr(q, "state", "") or "").lower()
+
     if state_l == "paid" or bool(getattr(q, "paid", False)):
         return MintStatusResp(
             mint_url=mint_url,
