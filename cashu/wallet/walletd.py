@@ -72,7 +72,6 @@ class MintExecuteResp(BaseModel):
     unit: str
     quote: str
     status: str  # "pending" | "paid" | "failed"
-    paid: bool
 
 class MintStatusReq(BaseModel):
     mint_url: Optional[str] = None
@@ -83,9 +82,7 @@ class MintStatusResp(BaseModel):
     mint_url: str
     unit: str
     quote: str
-    paid: bool
     status: str # "paid" | "claimable" | "failed" | "expired" | "canceled" | "pending"
-    failed: bool = False
 
 # ------------- Melt -------------
 class MeltQuoteReq(BaseModel):
@@ -110,7 +107,6 @@ class MeltExecuteResp(BaseModel):
     fee_paid_sat: Optional[int] = None
     preimage: Optional[str] = None
     status: str  # "paid" | "pending" | "failed"
-    paid: bool
 
 #class MeltStatusReq(BaseModel): # not needed for REST GET
     #payment_hash: str # 64hex
@@ -122,7 +118,6 @@ class MeltStatusResp(BaseModel):
     fee_paid_sat: Optional[int] = None
     preimage: Optional[str] = None
     status: str  # "paid" | "pending" | "failed"
-    paid: bool
 
 # --------- wallet construction helpers ---------
 
@@ -608,7 +603,6 @@ async def mint_execute_uds(req: MintExecuteReq):
             unit=u.name,
             quote=req.quote,
             status=(state or "pending"),
-            paid=False,
         )
 
     amount = int(getattr(q, "amount", 0) or 0)
@@ -649,7 +643,6 @@ async def mint_execute_uds(req: MintExecuteReq):
         unit=u.name,
         quote=req.quote,
         status="paid",
-        paid=True,
     )
 
 
@@ -670,14 +663,28 @@ async def mint_status_uds(req: MintStatusReq):
 
     # If we've already minted proofs locally, it's settled from walletd's perspective.
     if claimed:
-        return MintStatusResp(mint_url=mint_url, unit=u.name, quote=req.quote, paid=True, status="paid", failed=False)
+        return MintStatusResp(
+            mint_url=mint_url,
+            unit=u.name,
+            quote=req.quote,
+            status="paid",
+        )
 
     # Mint says invoice is paid, but we have not claimed proofs yet.
     if state_l == "paid" or bool(getattr(q, "paid", False)):
-        return MintStatusResp(mint_url=mint_url, unit=u.name, quote=req.quote, paid=False, status="claimable", failed=False)
+        return MintStatusResp(
+            mint_url=mint_url,
+            unit=u.name,
+            quote=req.quote,
+            status="claimable",
+        )
 
-    failed = state_l in {"failed", "expired", "canceled"}
-    return MintStatusResp(mint_url=mint_url, unit=u.name, quote=req.quote, paid=False, status=(state_l or "pending"), failed=failed)
+    return MintStatusResp(
+        mint_url=mint_url,
+        unit=u.name,
+        quote=req.quote,
+        status=(state_l or "pending"),
+    )
 
 # ------------- Melt -------------
 
@@ -720,7 +727,6 @@ async def melt_execute_uds(req: MeltExecuteReq):
             fee_paid_sat=melt_map.fee_paid_sat,
             preimage=melt_map.preimage,
             status=status,
-            paid=paid,
         )
     db = app.state.db
 
@@ -847,7 +853,6 @@ async def melt_status_uds(payment_hash: str):
             fee_paid_sat=melt_map.fee_paid_sat,
             preimage=melt_map.preimage,
             status=status,
-            paid=paid,
         )
 
     # 2) Non-terminal but not executing: return as-is (do not auto-execute)
@@ -859,7 +864,6 @@ async def melt_status_uds(payment_hash: str):
             fee_paid_sat=None,
             preimage=None,
             status=status,
-            paid=paid,
         )
 
     # 3) EXECUTING: if not stale, return pending
@@ -874,7 +878,6 @@ async def melt_status_uds(payment_hash: str):
             fee_paid_sat=None,
             preimage=None,
             status="pending",
-            paid=False,
         )
 
     # 4) Stale EXECUTING: attempt bounded reconciliation (READ-ONLY)
@@ -893,7 +896,6 @@ async def melt_status_uds(payment_hash: str):
                 fee_paid_sat=None,
                 preimage=None,
                 status="pending",
-                paid=False,
             )
 
         mq = await get_melt(melt_map.quote)
@@ -928,7 +930,6 @@ async def melt_status_uds(payment_hash: str):
             fee_paid_sat=None,
             preimage=None,
             status="pending",
-            paid=False,
         )
 
     # 5) Terminalize only when proven
@@ -955,7 +956,6 @@ async def melt_status_uds(payment_hash: str):
             fee_paid_sat=None,
             preimage=None,
             status="pending",
-            paid=False,
         )
 
     # 6) Return terminalized record
@@ -969,5 +969,4 @@ async def melt_status_uds(payment_hash: str):
         fee_paid_sat=melt_map2.fee_paid_sat,
         preimage=melt_map2.preimage,
         status=status,
-        paid=paid,
     )
